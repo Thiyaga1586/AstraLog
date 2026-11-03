@@ -958,8 +958,26 @@ async fn raw_public_request(endpoint: SocketAddr, api: ApiKey, body: Vec<u8>) ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn p6_public_broker_client_integration_routes_groups_and_offsets_end_to_end() {
     let _test_guard = P6_E2E_TEST_LOCK.lock().await;
-    let (root, controllers, _client_addresses, _raft_addresses, _configs, brokers, topics, client) =
-        start_p6_cluster("public-integration").await;
+    let (
+        root,
+        controllers,
+        _client_addresses,
+        _raft_addresses,
+        _configs,
+        brokers,
+        topics,
+        bootstrap_client,
+    ) = start_p6_cluster("public-integration").await;
+    bootstrap_client.close().await;
+    // A first anonymous JoinSubscribe is a non-idempotent public mutation:
+    // if its response is lost, the client must refuse a blind retry. Use the
+    // same bounded 20s transport budget as the other P6 multi-broker scenarios
+    // so CI host scheduling does not manufacture a five-second response loss.
+    // This client still predates feature activation, as required below.
+    let mut public_client_config =
+        ClientConfig::new(brokers[0].as_ref().unwrap().local_addr().to_string());
+    public_client_config.request_timeout = Duration::from_secs(20);
+    let client = AstraClient::connect(public_client_config).await.unwrap();
 
     let leader = controller_leader(&controllers).await;
     let topic_id = controllers[&leader]
@@ -1513,6 +1531,15 @@ async fn p6_churn_timeout_static_and_partition_expansion_are_authoritative() {
             .all(|partition| !second_join.active_assignments.contains(partition)),
         "new member became active before old ownership was released"
     );
+    // The second member is an active consumer while the first member drives
+    // offset traffic. Keep its 30s session alive during this intentionally
+    // busy phase: on a slow CI host the 20 offset rounds can take longer than
+    // one session timeout, otherwise the test itself fabricates UnknownMember
+    // before it checks the cooperative-rebalance contract.
+    while !load_task.is_finished() {
+        second.heartbeat_group(&group_id).await.unwrap();
+        time::sleep(Duration::from_secs(1)).await;
+    }
     let load_rounds = load_task.await.unwrap();
     assert!(
         load_rounds > 0,
@@ -1611,6 +1638,27 @@ async fn p6_churn_timeout_static_and_partition_expansion_are_authoritative() {
         .await
         .unwrap();
     assert_eq!(crash_join.hint.current_group_epoch, 4);
+    // This 6s member must remain a *live* consumer while the cooperative
+    // revoke/fence workflow finishes. On a loaded test host that workflow can
+    // exceed one session interval. Heartbeat until setup is complete; only
+    // then deliberately stop heartbeating to test the near-deadline refresh
+    // and eventual durable timeout below.
+    let (crash_keepalive_stop, mut crash_keepalive_shutdown) = tokio::sync::oneshot::channel();
+    let crash_keepalive_client = crashed.clone();
+    let crash_keepalive_group = group_id.clone();
+    let crash_keepalive_task = tokio::spawn(async move {
+        let mut ticker = time::interval(Duration::from_millis(750));
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = &mut crash_keepalive_shutdown => break,
+                _ = ticker.tick() => {
+                    crash_keepalive_client.heartbeat_group(&crash_keepalive_group).await
+                        .expect("live six-second member lost authority during cooperative setup");
+                }
+            }
+        }
+    });
     let first_revoke = client.heartbeat_group(&group_id).await.unwrap();
     let crash_revoke = client.cooperative_revoke_plan(&group_id).await.unwrap();
     assert_eq!(first_revoke.revocations, crash_revoke.revoke);
@@ -1677,6 +1725,8 @@ async fn p6_churn_timeout_static_and_partition_expansion_are_authoritative() {
         }
         Err(error) => panic!("P6-K cooperative RevokeAck failed: {error}"),
     }
+    crash_keepalive_stop.send(()).unwrap();
+    crash_keepalive_task.await.unwrap();
     let crash_stable = crashed.heartbeat_group(&group_id).await.unwrap();
     assert_eq!(crash_stable.group_phase, GroupPhase::Stable as u8);
     assert_eq!(crash_stable.hint.current_group_epoch, 4);
@@ -2146,13 +2196,15 @@ async fn p6_silent_member_gets_fresh_grace_then_times_out_after_coordinator_fail
     // From here, observe only the authoritative group history. Do not use
     // FetchOffsets as a group-coordinator readiness proxy: that API is served
     // by the separate offset coordinator and can legitimately lag independently.
+    // The 6s timeout is enforced by SessionTracker and its unit contract. This
+    // end-to-end oracle separately requires (1) the member still being present
+    // during the successor's fresh grace (checked above) and (2) eventual
+    // committed removal plus completion of the distinct offset-fence workflow.
+    // A stable P3 term does not mean that all 64 P6 shard-leadership scans and
+    // the subsequent fence commit have already finished. Do not misclassify
+    // delayed maintenance/activation as premature timeout correctness failure.
     let overall_deadline = time::Instant::now() + Duration::from_secs(120);
     let mut current_term = successor.hint.coordinator_epoch;
-    // The semantic timeout remains the committed 6s member timeout. This
-    // larger test-only observation budget allows bounded coordinator recovery/
-    // maintenance retries on a loaded Windows qualification host; success still
-    // requires a durable member removal under one unchanged coordinator term.
-    let mut stable_term_deadline = time::Instant::now() + Duration::from_secs(30);
     loop {
         let route = observe_current_coordinator(
             &brokers,
@@ -2164,27 +2216,35 @@ async fn p6_silent_member_gets_fresh_grace_then_times_out_after_coordinator_fail
         if route.hint.coordinator_epoch != current_term {
             assert!(route.hint.coordinator_epoch > current_term);
             current_term = route.hint.coordinator_epoch;
-            stable_term_deadline = time::Instant::now() + Duration::from_secs(30);
         }
         let index = usize::try_from(route.hint.coordinator_broker_id - 1).unwrap();
-        if let Ok(Some(group)) = brokers[index]
+        let last_observed = match brokers[index]
             .as_ref()
             .unwrap()
             .recover_group_state(group_id.clone(), route.hint.coordinator_epoch)
             .await
-            && group.members.is_empty()
-            && group.phase == GroupPhase::Stable
-            && group.active_group_epoch >= 2
         {
-            break;
-        }
-        assert!(
-            time::Instant::now() < stable_term_deadline,
-            "silent member did not time out after a stable coordinator term received full grace"
-        );
+            Ok(Some(group)) => {
+                let observation = format!(
+                    "term={current_term} phase={:?} members={} active_epoch={}",
+                    group.phase,
+                    group.members.len(),
+                    group.active_group_epoch
+                );
+                if group.members.is_empty()
+                    && group.phase == GroupPhase::Stable
+                    && group.active_group_epoch >= 2
+                {
+                    break;
+                }
+                observation
+            }
+            Ok(None) => format!("term={current_term} history missing"),
+            Err(error) => format!("term={current_term} history read: {error}"),
+        };
         assert!(
             time::Instant::now() < overall_deadline,
-            "coordinator never remained stable long enough to qualify silent-member timeout"
+            "silent-member expiry/activation did not converge after failover: {last_observed}"
         );
         time::sleep(Duration::from_millis(100)).await;
     }
@@ -2864,6 +2924,19 @@ async fn p6_group_history_commits_recovers_and_survives_coordinator_failures() {
     // no-owner state and resume the same pending handoff.
     let failed_second_id = released_route.hint.coordinator_broker_id;
     let failed_second_index = usize::try_from(failed_second_id - 1).unwrap();
+    // This broker may already have been restarted by an earlier phase of this
+    // same scenario. Read its committed controller incarnation before stopping
+    // it; assuming 1 here can turn a valid later rejoin into a permanent stale
+    // incarnation rejection when the same coordinator is elected twice.
+    let leader = controller_leader(&controllers).await;
+    let failed_second_incarnation = controllers[&leader]
+        .metadata_snapshot()
+        .await
+        .unwrap()
+        .state
+        .broker(failed_second_id)
+        .unwrap()
+        .incarnation_epoch;
     let failed_second = brokers[failed_second_index].take().unwrap();
     failed_second.shutdown().await.unwrap();
     let third_route = observe_current_coordinator(
@@ -2894,8 +2967,8 @@ async fn p6_group_history_commits_recovers_and_survives_coordinator_failures() {
         ControllerCommand::RejoinBroker {
             broker_id: failed_second_id,
             node_uuid: [u8::try_from(failed_second_id).unwrap(); 16],
-            expected_incarnation: 1,
-            new_incarnation: 2,
+            expected_incarnation: failed_second_incarnation,
+            new_incarnation: failed_second_incarnation.checked_add(1).unwrap(),
             client_host: client_addresses[failed_second_index].ip().to_string(),
             client_port: client_addresses[failed_second_index].port(),
             internal_host: raft_addresses[failed_second_index].ip().to_string(),

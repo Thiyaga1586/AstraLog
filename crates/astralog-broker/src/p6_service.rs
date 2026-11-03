@@ -52,6 +52,7 @@ const MAX_TRACKED_SESSION_GROUPS: usize = 1_024;
 const MAX_LEADERSHIP_DISCOVERY_GROUPS: usize = MAX_TRACKED_SESSION_GROUPS * 4;
 const LEADERSHIP_DISCOVERY_INTERVAL_MS: u64 = 1_000;
 const LEADERSHIP_REPLAY_BATCH_RECORDS: usize = 256;
+const MAX_LEADERSHIP_DISCOVERY_TASKS: usize = 8;
 const PRIVATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PRIVATE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -465,65 +466,81 @@ impl P6Service {
         let groups_topic_id = groups_topic.topic_id;
         let local_groups = self.replication.local_groups();
         let mut first_error = None;
+        let mut tasks = tokio::task::JoinSet::new();
         for local in local_groups
             .into_iter()
             .filter(|group| group.topic_id == groups_topic_id)
         {
-            let Some(status) = self
-                .replication
-                .status(groups_topic_id, local.partition)
-                .await
-            else {
-                continue;
-            };
-            if status.role != Role::Leader
-                || status.leader_broker_id != Some(self.local_broker_id)
-                || status.leader_epoch == 0
+            // Discover up to eight independent partition leaders concurrently.
+            // Sequentially fetching all 64 group-shard histories can starve the
+            // maintenance ticker and delay session expiration on a loaded host.
+            // Every shard still checks authoritative P3 leadership before
+            // installing fresh grace; bounded concurrency changes no authority
+            // or committed-history requirements.
+            let service = self.clone();
+            tasks.spawn(async move {
+                service
+                    .initialize_group_shard_leadership(groups_topic_id, local.partition)
+                    .await
+            });
+            if tasks.len() >= MAX_LEADERSHIP_DISCOVERY_TASKS
+                && let Some(result) = tasks.join_next().await
             {
-                continue;
-            }
-            let already_initialized = self
-                .initialized_group_shards
-                .lock()
-                .await
-                .get(&local.partition)
-                .copied()
-                == Some(status.leader_epoch);
-            if already_initialized {
-                continue;
-            }
-
-            let groups = match self
-                .recover_active_groups_on_shard(
-                    groups_topic_id,
-                    local.partition,
-                    status.leader_epoch,
-                )
-                .await
-            {
-                Ok(groups) => groups,
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                match result {
+                    Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+                    Err(_) if first_error.is_none() => {
+                        first_error = Some(P6Failure::unknown(PublicError::UnknownServerError));
                     }
-                    continue;
+                    _ => {}
                 }
-            };
-            if let Err(error) = self
-                .install_new_leader_grace(local.partition, status.leader_epoch, groups)
-                .await
-            {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
             }
-            self.initialized_group_shards
-                .lock()
-                .await
-                .insert(local.partition, status.leader_epoch);
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(P6Failure::unknown(PublicError::UnknownServerError));
+                }
+                _ => {}
+            }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    async fn initialize_group_shard_leadership(
+        &self,
+        groups_topic_id: astralog_common::TopicId,
+        shard: u32,
+    ) -> Result<(), P6Failure> {
+        let Some(status) = self.replication.status(groups_topic_id, shard).await else {
+            return Ok(());
+        };
+        if status.role != Role::Leader
+            || status.leader_broker_id != Some(self.local_broker_id)
+            || status.leader_epoch == 0
+        {
+            return Ok(());
+        }
+        if self
+            .initialized_group_shards
+            .lock()
+            .await
+            .get(&shard)
+            .copied()
+            == Some(status.leader_epoch)
+        {
+            return Ok(());
+        }
+        let groups = self
+            .recover_active_groups_on_shard(groups_topic_id, shard, status.leader_epoch)
+            .await?;
+        self.install_new_leader_grace(shard, status.leader_epoch, groups)
+            .await?;
+        self.initialized_group_shards
+            .lock()
+            .await
+            .insert(shard, status.leader_epoch);
+        Ok(())
     }
 
     async fn recover_active_groups_on_shard(
