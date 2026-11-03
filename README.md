@@ -2,6 +2,80 @@
 
 **Fault-Tolerant Distributed Event Streaming Infrastructure**
 
+## Control Center: local interactive dashboard
+
+AstraLog now includes a **read-only React dashboard** with an interactive React Flow broker topology, partition explorer, architecture diagrams, and Recharts benchmark comparisons. Live views come from a separate loopback-only Rust and Axum adapter that queries actual AstraLog Metadata V0. The optional preview is always labeled as sample data. The benchmark panels use historical evidence, not invented live metrics.
+
+```mermaid
+flowchart LR
+    UI[React, TypeScript, Vite] -->|HTTP GET, localhost| A[Axum read-only adapter]
+    A -->|Metadata V0| B[AstraLog broker]
+    B -->|partition leaders and replicas| A
+    UI -->|topology| RF[React Flow]
+    UI -->|historical benchmarks| RC[Recharts]
+```
+
+Run the disposable real RF3 local demo and UI in three **Windows CMD** windows:
+
+```bat
+scripts\run-control-center.cmd
+```
+
+Alternatively, start each service manually:
+
+```bat
+rem Window 1: Real AstraLog RF3 brokers with opt-in test traffic
+cargo run -p astralog-broker --example control_center_demo -- --traffic
+
+rem Window 2: Read-only HTTP adapter
+cargo run -p astralog-dashboard -- --bootstrap 127.0.0.1:7001 --bind 127.0.0.1:8787 --poll-timeout-ms 5000
+
+rem Window 3: React dashboard
+cd dashboard\web
+npm ci
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. See the [complete Control Center guide](docs/CONTROL_CENTER.md) for architecture, limitations and exact setup instructions. This is a local portfolio interface, not a qualified P11 security or observability release.
+
+## Live Prometheus and Grafana monitoring MVP
+
+The broker now supports an optional **loopback-only** Prometheus scrape endpoint.
+The disposable RF3 demo exposes `/metrics` on ports 9201, 9202 and 9203.
+It exports actual acknowledged Produce record and value-byte counts, returned
+Fetch volumes, completed Produce/Fetch request success and error counts, and
+server-handling latency histogram buckets. No metric is populated from preview
+data or the historical interview benchmark.
+
+```mermaid
+flowchart LR
+    Client[Real test Produce / Fetch] --> B[Three AstraLog brokers]
+    B -->|Per broker /metrics| P[Prometheus]
+    P -->|PromQL rates and histogram_quantile| G[Grafana]
+    UI[AstraLog Control Center] -->|Read-only Metadata V0| B
+```
+
+On Windows CMD, start Docker Desktop and the instrumented demo first.
+Then launch the monitoring services:
+
+```bat
+scripts\run-control-center.cmd
+scripts\run-monitoring.cmd
+```
+
+Prometheus targets: `http://127.0.0.1:9090/targets`.
+Grafana: `http://127.0.0.1:3000`, dashboard `AstraLog Engineering MVP`.
+Grafana requires login as `admin`; `scripts\run-monitoring.cmd` generates
+a strong private password in the Git-ignored file
+`observability\secrets\grafana_admin_password.txt`. Use Windows CMD
+`type observability\secrets\grafana_admin_password.txt` to view it locally.
+Anonymous access and public signup are disabled.
+See [the exact monitoring contract and validation steps](docs/MONITORING_MVP.md).
+Acknowledged Produce records/sec includes successful duplicate retry responses
+and is **not** a claim of uniquely committed record throughput. Dashboard
+latency is computed from live histogram samples, never copied from benchmarks.
+This local demonstration does not qualify the complete P11 observability phase.
+
 AstraLog is a from-first-principles **Rust distributed event log** inspired by useful ideas from Kafka, Apache Pulsar/BookKeeper, and Raft — without using Kafka, Pulsar, BookKeeper, ZooKeeper, etcd, RabbitMQ, or another broker internally. A work-queue extension was planned but is **not implemented**.
 
 The project is intentionally built to expose the hard systems problems rather than hiding them:
