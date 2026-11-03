@@ -5,6 +5,7 @@ members = [
     "crates/astralog-client",
     "crates/astralog-common",
     "crates/astralog-controller",
+    "crates/astralog-dashboard",
     "crates/astralog-groups",
     "crates/astralog-protocol",
     "crates/astralog-raft",
@@ -29,11 +30,15 @@ astralog-protocol = { path = "crates/astralog-protocol" }
 astralog-raft = { path = "crates/astralog-raft" }
 astralog-replication = { path = "crates/astralog-replication" }
 astralog-storage = { path = "crates/astralog-storage" }
+axum = "0.8"
 crc32c = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 getrandom = "0.3"
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tower-http = { version = "0.6", features = ["cors"] }
 zstd = { version = "=0.14.0", default-features = false }
 
 [profile.release]

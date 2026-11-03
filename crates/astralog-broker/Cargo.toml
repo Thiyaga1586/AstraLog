@@ -13,6 +13,7 @@ astralog-protocol.workspace = true
 astralog-raft.workspace = true
 astralog-replication.workspace = true
 astralog-storage.workspace = true
+axum.workspace = true
 crc32c.workspace = true
 getrandom.workspace = true
 tokio.workspace = true

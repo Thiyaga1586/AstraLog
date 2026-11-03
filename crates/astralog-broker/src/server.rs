@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use astralog_common::{ProducerAuthority, ProducerSequence, StreamOffset, TopicId};
@@ -26,6 +26,7 @@ use astralog_protocol::{
     encode_frame, select_wire_version,
 };
 use astralog_storage::{CompactionLimits, DataRecord};
+use axum::{Router, http::header, routing::get};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -49,6 +50,7 @@ use crate::{
     load_shaping::{
         DataAdmissionGate, DataAdmissionLimits, DataAdmissionPermit, QuotaGate, QuotaLimits,
     },
+    monitoring::BrokerMetrics,
     offset_coordinator::{
         OffsetCommitOutcome, OffsetCoordinatorError, OffsetCoordinatorRuntime,
         OffsetCoordinatorRuntimeConfig, OffsetFenceCommitOutcome, OffsetFetchOutcome,
@@ -65,6 +67,10 @@ const MIN_OPERATIONAL_FRAME_LEN: usize = 1024;
 pub struct BrokerConfig {
     pub data_dir: PathBuf,
     pub bind_addr: SocketAddr,
+    /// An optional, independent local HTTP endpoint exposing read-only metrics.
+    /// None by default, so legacy test and production configurations do not
+    /// open a new listener without an explicit operator opt-in.
+    pub metrics_bind_addr: Option<SocketAddr>,
     pub advertised_host: String,
     pub advertised_port: u16,
     pub broker_id: u32,
@@ -97,6 +103,7 @@ impl BrokerConfig {
         Self {
             data_dir: data_dir.into(),
             bind_addr,
+            metrics_bind_addr: None,
             advertised_host: bind_addr.ip().to_string(),
             advertised_port: bind_addr.port(),
             broker_id: 1,
@@ -132,6 +139,13 @@ impl BrokerConfig {
         if !self.bind_addr.ip().is_loopback() {
             return Err(BrokerError::InvalidConfig(
                 "unauthenticated AstraLog demo must bind only to loopback",
+            ));
+        }
+        if let Some(addr) = self.metrics_bind_addr
+            && (!addr.ip().is_loopback() || addr.port() == 0 || addr == self.bind_addr)
+        {
+            return Err(BrokerError::InvalidConfig(
+                "metrics endpoint requires a distinct, nonzero loopback address",
             ));
         }
         if !(MIN_OPERATIONAL_FRAME_LEN..=MAX_WIRE_FRAME_LEN_V1).contains(&self.max_frame_len) {
@@ -256,6 +270,8 @@ pub struct BrokerHandle {
     state: Arc<BrokerState>,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
+    metrics_shutdown: Option<oneshot::Sender<()>>,
+    metrics_task: Option<tokio::task::JoinHandle<()>>,
     p6_maintenance_shutdown: Option<oneshot::Sender<()>>,
     p6_maintenance_task: Option<tokio::task::JoinHandle<()>>,
     replication: Option<ReplicationRuntimeHandle>,
@@ -541,6 +557,12 @@ impl BrokerHandle {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.metrics_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.metrics_task.take() {
+            let _ = task.await;
+        }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -572,6 +594,13 @@ impl BrokerHandle {
 
 pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
     config.validate()?;
+    let metrics = Arc::new(BrokerMetrics::new(config.broker_id));
+    // Bind at startup so port conflicts fail before broker state is mutated.
+    let metrics_listener = if let Some(addr) = config.metrics_bind_addr {
+        Some(TcpListener::bind(addr).await?)
+    } else {
+        None
+    };
     let data_admission = DataAdmissionGate::new(DataAdmissionLimits {
         max_in_flight: config.max_data_in_flight,
         max_bytes: config.max_data_in_flight_bytes,
@@ -732,7 +761,37 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
 
     let handle_state = state.clone();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let (metrics_shutdown, metrics_task) = if let Some(metrics_listener) = metrics_listener {
+        let (signal, shutdown) = oneshot::channel();
+        let metrics_state = metrics.clone();
+        let router = Router::new().route(
+            "/metrics",
+            get(move || {
+                let metrics_state = metrics_state.clone();
+                async move {
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )],
+                        metrics_state.render(),
+                    )
+                }
+            }),
+        );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(metrics_listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown.await;
+                })
+                .await;
+        });
+        (Some(signal), Some(task))
+    } else {
+        (None, None)
+    };
     let connection_limit = Arc::new(Semaphore::new(config.max_connections));
+    let metrics_for_connections = metrics.clone();
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         loop {
@@ -750,6 +809,7 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
                     let data_admission = data_admission.clone();
                     let quota = quota.clone();
                     let connection_config = config.clone();
+                    let metrics = metrics_for_connections.clone();
                     connections.spawn(async move {
                         let _permit = permit;
                         let _ = serve_connection(
@@ -759,6 +819,7 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
                             data_admission,
                             quota,
                             connection_config,
+                            metrics,
                         )
                         .await;
                     });
@@ -775,6 +836,8 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
         state: handle_state,
         shutdown: Some(shutdown_tx),
         task,
+        metrics_shutdown,
+        metrics_task,
         p6_maintenance_shutdown,
         p6_maintenance_task,
         replication: replication_handle,
@@ -791,6 +854,7 @@ async fn serve_connection(
     data_admission: Arc<DataAdmissionGate>,
     quota: Arc<QuotaGate>,
     config: BrokerConfig,
+    metrics: Arc<BrokerMetrics>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let mut hello_bytes = [0_u8; 16];
@@ -826,7 +890,21 @@ async fn serve_connection(
     }
 
     let (reader, writer) = stream.into_split();
-    serve_framed_connection(reader, writer, state, p6, data_admission, quota, config).await
+    serve_framed_connection(
+        reader,
+        writer,
+        state,
+        p6,
+        data_admission,
+        quota,
+        ConnectionContext { config, metrics },
+    )
+    .await
+}
+
+struct ConnectionContext {
+    config: BrokerConfig,
+    metrics: Arc<BrokerMetrics>,
 }
 
 async fn serve_framed_connection(
@@ -836,8 +914,9 @@ async fn serve_framed_connection(
     p6: Option<Arc<P6Service>>,
     data_admission: Arc<DataAdmissionGate>,
     quota: Arc<QuotaGate>,
-    config: BrokerConfig,
+    context: ConnectionContext,
 ) -> Result<()> {
+    let ConnectionContext { config, metrics } = context;
     let writer = Arc::new(Mutex::new(writer));
     let active_correlations = Arc::new(Mutex::new(HashSet::<u64>::new()));
     let permits = Arc::new(Semaphore::new(config.max_in_flight_per_connection));
@@ -961,6 +1040,7 @@ async fn serve_framed_connection(
                     PublicError::BrokerBusy,
                     config.overload_throttle_ms,
                 );
+                metrics.observe_response(&frame, &response, Duration::ZERO);
                 write_response(&writer, response, config.max_frame_len).await?;
                 continue;
             };
@@ -978,6 +1058,7 @@ async fn serve_framed_connection(
                             PublicError::BrokerBusy,
                             config.overload_throttle_ms,
                         );
+                        metrics.observe_response(&frame, &response, Duration::ZERO);
                         write_response(&writer, response, config.max_frame_len).await?;
                         continue;
                     }
@@ -997,6 +1078,7 @@ async fn serve_framed_connection(
                     PublicError::BrokerBusy,
                     rejection.throttle_ms,
                 );
+                metrics.observe_response(&frame, &response, Duration::ZERO);
                 write_response(&writer, response, config.max_frame_len).await?;
                 continue;
             }
@@ -1006,11 +1088,13 @@ async fn serve_framed_connection(
             let p6 = p6.clone();
             let active = active_correlations.clone();
             let max_frame_len = config.max_frame_len;
+            let metrics = metrics.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 let _data_permit: Option<DataAdmissionPermit> = data_permit;
                 let correlation_id = frame.correlation_id;
                 let timeout = Duration::from_millis(u64::from(frame.timeout_ms));
+                let started = StdInstant::now();
                 let response = match time::timeout(
                     timeout,
                     dispatch_request(state, p6, &frame, max_frame_len),
@@ -1021,6 +1105,7 @@ async fn serve_framed_connection(
                     Ok(Err(error)) => error_response(&frame, error),
                     Err(_) => error_response(&frame, PublicError::RequestTimeout),
                 };
+                metrics.observe_response(&frame, &response, started.elapsed());
                 let _ = write_response(&writer, response, max_frame_len).await;
                 active.lock().await.remove(&correlation_id);
             });

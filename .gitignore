@@ -6,3 +6,4 @@
 /artifacts/
 /data/
 /fuzz/target/
+/observability/secrets/

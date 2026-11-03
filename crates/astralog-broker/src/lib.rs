@@ -6,6 +6,7 @@ mod error;
 mod group_coordinator;
 mod load_shaping;
 mod metadata_cache;
+mod monitoring;
 mod offset_coordinator;
 mod p6_service;
 mod replication;
