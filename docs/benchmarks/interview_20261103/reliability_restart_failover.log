@@ -1,0 +1,29 @@
+=== RF1 RESTART ===
+cargo :     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+At line:2 char:500
++ ... lePath $log;cargo test -p astralog-broker --test p2_network single_br ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `t...get(s) in 0.15s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+     Running tests\p2_network.rs (target\debug\deps\p2_network-1f04e5bef040ed7a.exe)
+
+running 1 test
+test single_broker_round_trip_survives_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.30s
+
+=== RF3 P7 FAILOVER/DEDUPE ===
+cargo :     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+At line:2 char:768
++ ... log -Append;cargo test -p astralog-broker --test p7_failover p7_rf3_l ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `t...get(s) in 0.15s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+     Running tests\p7_failover.rs (target\debug\deps\p7_failover-d500d20727e3b320.exe)
+
+running 1 test
+test p7_rf3_leader_death_after_quorum_before_response_deduplicates_on_successor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 9.31s

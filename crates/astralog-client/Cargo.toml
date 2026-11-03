@@ -1,0 +1,13 @@
+[package]
+name = "astralog-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+astralog-common.workspace = true
+astralog-groups.workspace = true
+astralog-protocol.workspace = true
+getrandom.workspace = true
+tokio.workspace = true

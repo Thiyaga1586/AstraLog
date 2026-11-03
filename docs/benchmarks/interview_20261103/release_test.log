@@ -1,0 +1,74 @@
+cargo :    Compiling getrandom v0.4.3
+At line:2 char:623
++ ... t-Null;try {cargo test --release -p astralog-broker --test interview_ ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling getrandom v0.4.3:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling cfg-if v1.0.5
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.14
+   Compiling jobserver v0.1.35
+   Compiling cc v1.6.0
+   Compiling version_check v0.9.5
+   Compiling pkg-config v0.3.34
+   Compiling generic-array v0.14.7
+   Compiling windows-link v0.2.1
+   Compiling windows-sys v0.61.2
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling crc32c v0.6.8
+   Compiling typenum v1.20.1
+   Compiling astralog-common v0.1.0 (D:\Workspace\AstraLog\crates\astralog-common)
+   Compiling zstd-safe v8.0.0
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.3
+   Compiling bytes v1.12.1
+   Compiling pin-project-lite v0.2.17
+   Compiling tokio v1.53.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling astralog-protocol v0.1.0 (D:\Workspace\AstraLog\crates\astralog-protocol)
+   Compiling astralog-groups v0.1.0 (D:\Workspace\AstraLog\crates\astralog-groups)
+   Compiling digest v0.10.7
+   Compiling zstd v0.14.0
+   Compiling getrandom v0.3.4
+   Compiling lz4_flex v0.14.0
+   Compiling cpufeatures v0.2.17
+   Compiling astralog-raft v0.1.0 (D:\Workspace\AstraLog\crates\astralog-raft)
+   Compiling astralog-storage v0.1.0 (D:\Workspace\AstraLog\crates\astralog-storage)
+   Compiling sha2 v0.10.9
+   Compiling astralog-replication v0.1.0 (D:\Workspace\AstraLog\crates\astralog-replication)
+   Compiling astralog-controller v0.1.0 (D:\Workspace\AstraLog\crates\astralog-controller)
+   Compiling astralog-broker v0.1.0 (D:\Workspace\AstraLog\crates\astralog-broker)
+warning: unused variable: `error`
+    --> crates\astralog-broker\src\replication.rs:2196:28
+     |
+2196 |                 if let Err(error) = handled {
+     |                            ^^^^^ help: if this is intentional, prefix it with an underscore: `_error`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling astralog-client v0.1.0 (D:\Workspace\AstraLog\crates\astralog-client)
+warning: `astralog-broker` (lib) generated 1 warning (run `cargo fix --lib -p astralog-broker` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 4m 27s
+     Running tests\interview_benchmark.rs (target\release\deps\interview_benchmark-fae804f2db49f68f.exe)
+
+running 2 tests
+test interview_rf1_roundtrip_and_benchmark ... ASTRALOG_INTERVIEW_CSV=d7e32d3,rf1,leader,false,1,1024,4,2500,248,97.856,0.096,40.841,46.025,48.046,2534.326,248,38409,146.294,216.184,278.536,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf1,quorum,false,1,1024,4,2500,200,78.055,0.076,43.559,104.554,133.654,2562.281,200,21830,109.081,124.954,134.728,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf1,leader,false,2,1024,4,2500,223,87.631,0.086,44.191,58.693,74.180,2544.757,223,26954,121.470,137.609,141.532,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf1,quorum,false,2,1024,4,2500,218,85.920,0.084,44.880,60.462,71.022,2537.255,218,25976,117.904,137.473,143.681,0
+ASTRALOG_INTERVIEW_DATA_DIR=C:\Users\REDACTED\AppData\Local\Temp\astralog-interview-rf1-12708-1793674102122565100
+ok
+test interview_rf3_roundtrip_and_benchmark ... ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,leader,false,1,1024,4,2500,39,13.974,0.014,277.728,372.652,396.640,2790.909,39,1223,28.592,49.365,50.631,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,leader,true,1,1024,4,2500,140,54.017,0.053,72.927,133.184,142.307,2591.760,140,4010,26.788,42.484,52.742,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,quorum,false,1,1024,4,2500,38,14.522,0.014,268.527,386.563,418.732,2616.642,38,1139,28.473,45.763,48.084,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,quorum,true,1,1024,4,2500,120,46.614,0.046,87.143,98.687,99.840,2574.317,120,3146,24.002,39.443,46.173,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,leader,false,2,1024,4,2500,41,14.993,0.015,263.623,351.496,358.803,2734.680,41,1272,28.137,52.123,57.427,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,leader,true,2,1024,4,2500,140,54.385,0.053,72.533,131.776,162.768,2574.246,140,4066,27.665,44.257,49.463,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,quorum,false,2,1024,4,2500,40,14.166,0.014,261.053,366.992,381.539,2823.684,40,1157,26.853,38.625,44.942,0
+ASTRALOG_INTERVIEW_CSV=d7e32d3,rf3,quorum,true,2,1024,4,2500,120,47.566,0.046,79.594,108.991,112.359,2522.788,120,3157,24.190,40.052,43.419,0
+ASTRALOG_INTERVIEW_DATA_DIR=C:\Users\REDACTED\AppData\Local\Temp\astralog-interview-rf3-12708-1793674226331518500
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 179.91s

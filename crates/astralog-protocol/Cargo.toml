@@ -1,0 +1,10 @@
+[package]
+name = "astralog-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+astralog-common.workspace = true
+crc32c.workspace = true

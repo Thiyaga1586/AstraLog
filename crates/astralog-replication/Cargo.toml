@@ -1,0 +1,14 @@
+[package]
+name = "astralog-replication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+astralog-common.workspace = true
+astralog-raft.workspace = true
+astralog-storage.workspace = true
+crc32c.workspace = true
+sha2.workspace = true
+tokio.workspace = true

@@ -1,0 +1,8 @@
+/target/
+/.bootstrap/
+*.tmp
+*.profraw
+*.profdata
+/artifacts/
+/data/
+/fuzz/target/

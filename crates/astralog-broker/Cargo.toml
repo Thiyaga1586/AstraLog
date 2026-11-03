@@ -1,0 +1,21 @@
+[package]
+name = "astralog-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+astralog-common.workspace = true
+astralog-controller.workspace = true
+astralog-groups.workspace = true
+astralog-protocol.workspace = true
+astralog-raft.workspace = true
+astralog-replication.workspace = true
+astralog-storage.workspace = true
+crc32c.workspace = true
+getrandom.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+astralog-client.workspace = true

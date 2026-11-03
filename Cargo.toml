@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/astralog-benchmark",
+    "crates/astralog-broker",
+    "crates/astralog-client",
+    "crates/astralog-common",
+    "crates/astralog-controller",
+    "crates/astralog-groups",
+    "crates/astralog-protocol",
+    "crates/astralog-raft",
+    "crates/astralog-replication",
+    "crates/astralog-storage",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+astralog-benchmark = { path = "crates/astralog-benchmark" }
+astralog-common = { path = "crates/astralog-common" }
+astralog-controller = { path = "crates/astralog-controller" }
+astralog-groups = { path = "crates/astralog-groups" }
+astralog-client = { path = "crates/astralog-client" }
+astralog-protocol = { path = "crates/astralog-protocol" }
+astralog-raft = { path = "crates/astralog-raft" }
+astralog-replication = { path = "crates/astralog-replication" }
+astralog-storage = { path = "crates/astralog-storage" }
+crc32c = "0.6"
+sha2 = "0.10"
+getrandom = "0.3"
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+zstd = { version = "=0.14.0", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
