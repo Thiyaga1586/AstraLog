@@ -25,3 +25,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard/web
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Node version
+        run: node --version
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Typecheck and build dashboard
+        run: npm run build
+      - name: Test dashboard data contracts
+        run: npm test
