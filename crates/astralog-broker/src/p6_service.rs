@@ -38,7 +38,7 @@ use crate::{
     controller::{DynamicBrokerControl, GroupCoordinatorObservation},
     group_coordinator::{GroupCoordinatorClient, GroupCoordinatorError},
     offset_coordinator::{OffsetCoordinatorClient, OffsetCoordinatorError},
-    replication::ReplicationClient,
+    replication::{PartitionStatus, ReplicationClient},
 };
 
 pub(crate) const PRIVATE_P6_OFFSET_API: u16 = 65_000;
@@ -53,6 +53,7 @@ const MAX_LEADERSHIP_DISCOVERY_GROUPS: usize = MAX_TRACKED_SESSION_GROUPS * 4;
 const LEADERSHIP_DISCOVERY_INTERVAL_MS: u64 = 1_000;
 const LEADERSHIP_REPLAY_BATCH_RECORDS: usize = 256;
 const MAX_LEADERSHIP_DISCOVERY_TASKS: usize = 8;
+const LEADERSHIP_DISCOVERY_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const PRIVATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PRIVATE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -425,7 +426,6 @@ impl P6Service {
         if !self.ready() {
             return;
         }
-        let _ = self.initialize_new_group_leadership().await;
         let group_ids = self
             .sessions
             .lock()
@@ -446,6 +446,15 @@ impl P6Service {
             // awaits this whole bounded set before starting the next round, which
             // prevents per-group overlap while removing cross-group head-of-line
             // blocking from slow fence/routing work.
+        }
+    }
+
+    /// Discover previously committed members after a P3 leadership change.
+    /// Run independently of session maintenance so a slow or large history
+    /// replay cannot starve expiry of already tracked groups.
+    pub(crate) async fn discover_leadership_once(&self) {
+        if self.ready() {
+            let _ = self.initialize_new_group_leadership().await;
         }
     }
 
@@ -478,6 +487,10 @@ impl P6Service {
             // installing fresh grace; bounded concurrency changes no authority
             // or committed-history requirements.
             let service = self.clone();
+            // The scan is in its own supervisor, separately from expiry
+            // maintenance. Bound each actor read rather than the entire replay:
+            // a legitimate large shard must not be cancelled every three
+            // seconds and starve forever.
             tasks.spawn(async move {
                 service
                     .initialize_group_shard_leadership(groups_topic_id, local.partition)
@@ -512,13 +525,16 @@ impl P6Service {
         groups_topic_id: astralog_common::TopicId,
         shard: u32,
     ) -> Result<(), P6Failure> {
-        let Some(status) = self.replication.status(groups_topic_id, shard).await else {
+        let Some(status) = time::timeout(
+            LEADERSHIP_DISCOVERY_IO_TIMEOUT,
+            self.replication.status(groups_topic_id, shard),
+        )
+        .await
+        .map_err(|_| P6Failure::unknown(PublicError::RequestTimeout))?
+        else {
             return Ok(());
         };
-        if status.role != Role::Leader
-            || status.leader_broker_id != Some(self.local_broker_id)
-            || status.leader_epoch == 0
-        {
+        if !committed_local_group_leadership(status, self.local_broker_id, None) {
             return Ok(());
         }
         if self
@@ -534,6 +550,25 @@ impl P6Service {
         let groups = self
             .recover_active_groups_on_shard(groups_topic_id, shard, status.leader_epoch)
             .await?;
+        // Recheck *after* replay as well. An in-flight leadership transition
+        // must not install an incomplete/stale tracker or mark this term as
+        // initialized. The next scan will retry once the barrier commits.
+        let Some(after_replay) = time::timeout(
+            LEADERSHIP_DISCOVERY_IO_TIMEOUT,
+            self.replication.status(groups_topic_id, shard),
+        )
+        .await
+        .map_err(|_| P6Failure::unknown(PublicError::RequestTimeout))?
+        else {
+            return Ok(());
+        };
+        if !committed_local_group_leadership(
+            after_replay,
+            self.local_broker_id,
+            Some(status.leader_epoch),
+        ) {
+            return Ok(());
+        }
         self.install_new_leader_grace(shard, status.leader_epoch, groups)
             .await?;
         self.initialized_group_shards
@@ -552,18 +587,20 @@ impl P6Service {
         let mut states = BTreeMap::<GroupId, GroupStateMachine>::new();
         let mut start = StreamOffset::new(0);
         loop {
-            let page = self
-                .replication
-                .fetch(
+            let page = time::timeout(
+                LEADERSHIP_DISCOVERY_IO_TIMEOUT,
+                self.replication.fetch(
                     topic_id,
                     shard,
                     Some(leader_epoch),
                     start,
                     LEADERSHIP_REPLAY_BATCH_RECORDS,
                     usize::MAX,
-                )
-                .await
-                .map_err(|error| P6Failure::unknown(error.error))?;
+                ),
+            )
+            .await
+            .map_err(|_| P6Failure::unknown(PublicError::RequestTimeout))?
+            .map_err(|error| P6Failure::unknown(error.error))?;
             if page.records.is_empty() {
                 break;
             }
@@ -649,6 +686,19 @@ impl P6Service {
             sessions.remove(&group_id);
         }
         for (group_id, group) in groups {
+            if let Some(existing) = sessions.get_mut(&group_id)
+                && existing.coordinator_epoch == leader_epoch
+            {
+                // A public Join/Heartbeat can establish an in-term session
+                // while the discovery replay is pending. Never grant that
+                // same member a second full grace merely because discovery
+                // completed later in the term.
+                existing
+                    .tracker
+                    .reconcile_committed_group(now, &group)
+                    .map_err(|_| P6Failure::unknown(PublicError::UnknownServerError))?;
+                continue;
+            }
             let tracker = SessionTracker::new_leader(now, &group)
                 .map_err(|_| P6Failure::unknown(PublicError::UnknownServerError))?;
             sessions.insert(
@@ -1852,6 +1902,22 @@ impl P6Service {
     }
 }
 
+/// A Role::Leader observation alone is insufficient for committed group replay:
+/// Raft publishes that role before the new term's leader barrier is committed.
+/// Without this gate an empty pre-barrier fetch can be cached as a complete
+/// recovery for the entire term, leaving surviving members without timers.
+fn committed_local_group_leadership(
+    status: PartitionStatus,
+    local_broker_id: u32,
+    expected_epoch: Option<u64>,
+) -> bool {
+    status.role == Role::Leader
+        && status.leader_broker_id == Some(local_broker_id)
+        && status.leader_epoch != 0
+        && status.current_term_committed
+        && expected_epoch.is_none_or(|epoch| epoch == status.leader_epoch)
+}
+
 fn validate_internal_topics(state: &ControllerState) -> Result<(), ()> {
     for descriptor in P6_INTERNAL_TOPICS {
         let topic = state.topic_by_name(descriptor.name).ok_or(())?;
@@ -2298,5 +2364,42 @@ fn offset_error(error: OffsetCoordinatorError) -> (PublicError, u32, u64) {
             UNKNOWN_BROKER_ID,
             UNKNOWN_EPOCH,
         ),
+    }
+}
+
+#[cfg(test)]
+mod leadership_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn pre_barrier_leader_does_not_install_or_cache_session_grace() {
+        let pre_barrier = PartitionStatus {
+            role: Role::Leader,
+            leader_broker_id: Some(2),
+            leader_epoch: 7,
+            current_term_committed: false,
+            log_start_offset: 0,
+            high_watermark: 0,
+        };
+        // The exact state Raft exposes between election and barrier commit.
+        assert!(!committed_local_group_leadership(pre_barrier, 2, None));
+        assert!(!committed_local_group_leadership(pre_barrier, 2, Some(7)));
+
+        let ready = PartitionStatus {
+            current_term_committed: true,
+            ..pre_barrier
+        };
+        assert!(committed_local_group_leadership(ready, 2, None));
+        assert!(committed_local_group_leadership(ready, 2, Some(7)));
+        assert!(!committed_local_group_leadership(ready, 2, Some(6)));
+        assert!(!committed_local_group_leadership(ready, 3, None));
+        assert!(!committed_local_group_leadership(
+            PartitionStatus {
+                role: Role::Follower,
+                ..ready
+            },
+            2,
+            None,
+        ));
     }
 }

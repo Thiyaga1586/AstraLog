@@ -762,6 +762,8 @@ pub(crate) struct PartitionStatus {
     pub role: Role,
     pub leader_broker_id: Option<u32>,
     pub leader_epoch: u64,
+    /// False for a newly elected leader until its current-term barrier commits.
+    pub current_term_committed: bool,
     pub log_start_offset: u64,
     pub high_watermark: u64,
 }
@@ -3285,6 +3287,7 @@ fn partition_status(replica: &ReplicatedPartition) -> PartitionStatus {
         role,
         leader_broker_id: leader_node.and_then(|node| node_to_broker(node).ok()),
         leader_epoch: replica.leader_epoch(),
+        current_term_committed: replica.current_term_committed(),
         log_start_offset: replica
             .committed_log_start_offset()
             .map(StreamOffset::get)

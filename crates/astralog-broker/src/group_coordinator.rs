@@ -528,6 +528,11 @@ impl CoordinatorWorker {
                 leader_epoch: status.leader_epoch,
             });
         }
+        if !status.current_term_committed {
+            return Err(GroupCoordinatorError::NotReady(
+                "current-term group leader barrier is not durably committed",
+            ));
+        }
         Ok((topic.topic_id, shard))
     }
 }

@@ -368,6 +368,14 @@ impl ReplicatedPartition {
         committed_term == Some(hard_state.current_term)
     }
 
+    /// The local leader has durably committed an entry in its current term.
+    /// In particular, a newly elected leader's barrier is committed, so
+    /// consumers of committed history must not treat its pre-barrier view as
+    /// a complete recovery snapshot.
+    pub fn current_term_committed(&self) -> bool {
+        self.idempotent_leader_ready()
+    }
+
     pub fn next_stream_offset(&self) -> StreamOffset {
         self.persistence.next_stream_offset()
     }

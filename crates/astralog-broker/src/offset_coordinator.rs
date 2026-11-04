@@ -758,6 +758,11 @@ impl OffsetWorker {
                 leader_epoch: status.leader_epoch,
             });
         }
+        if !status.current_term_committed {
+            return Err(OffsetCoordinatorError::NotReady(
+                "current-term offsets leader barrier is not durably committed",
+            ));
+        }
         Ok((topic.topic_id, shard))
     }
 }

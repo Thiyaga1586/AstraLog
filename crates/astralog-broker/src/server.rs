@@ -274,6 +274,8 @@ pub struct BrokerHandle {
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     p6_maintenance_shutdown: Option<oneshot::Sender<()>>,
     p6_maintenance_task: Option<tokio::task::JoinHandle<()>>,
+    p6_discovery_shutdown: Option<oneshot::Sender<()>>,
+    p6_discovery_task: Option<tokio::task::JoinHandle<()>>,
     replication: Option<ReplicationRuntimeHandle>,
     groups: Option<GroupCoordinatorRuntime>,
     offsets: Option<OffsetCoordinatorRuntime>,
@@ -569,11 +571,21 @@ impl BrokerHandle {
         if let Some(shutdown) = self.p6_maintenance_shutdown.take() {
             let _ = shutdown.send(());
         }
+        if let Some(shutdown) = self.p6_discovery_shutdown.take() {
+            let _ = shutdown.send(());
+        }
         let result = self
             .task
             .await
             .map_err(|err| BrokerError::TaskJoin(err.to_string()))?;
         if let Some(task) = self.p6_maintenance_task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.p6_discovery_task.take() {
+            // Discovery performs only read-only recovery and leader-local
+            // session installation. Cancel outstanding scans before tearing
+            // down replication rather than waiting for a large replay.
+            task.abort();
             let _ = task.await;
         }
         if let Some(replication) = self.replication.take() {
@@ -735,6 +747,23 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
     } else {
         (None, None)
     };
+    let (p6_discovery_shutdown, p6_discovery_task) = if let Some(service) = &p6_service {
+        let service = service.clone();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_millis(1_000));
+            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    _ = ticker.tick() => service.discover_leadership_once().await,
+                }
+            }
+        });
+        (Some(shutdown_tx), Some(task))
+    } else {
+        (None, None)
+    };
 
     let runtime = RuntimeConfig {
         data_dir: config.data_dir.clone(),
@@ -840,6 +869,8 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
         metrics_task,
         p6_maintenance_shutdown,
         p6_maintenance_task,
+        p6_discovery_shutdown,
+        p6_discovery_task,
         replication: replication_handle,
         groups: group_coordinator,
         offsets: offset_coordinator,

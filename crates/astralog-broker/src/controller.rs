@@ -742,9 +742,10 @@ impl DynamicBrokerControl {
         if status.role != Role::Leader
             || status.leader_broker_id != Some(self.local_broker_id)
             || status.leader_epoch != expected_coordinator_epoch
+            || !status.current_term_committed
         {
             return Err(BrokerError::Metadata(
-                "local broker is no longer the current P3 group coordinator",
+                "local P3 group coordinator lacks committed current-term leadership",
             ));
         }
         Ok(observation)
