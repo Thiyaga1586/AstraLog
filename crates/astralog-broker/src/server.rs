@@ -268,6 +268,8 @@ impl BrokerConfig {
 pub struct BrokerHandle {
     local_addr: SocketAddr,
     state: Arc<BrokerState>,
+    #[cfg(debug_assertions)]
+    p6_service: Option<Arc<P6Service>>,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
     metrics_shutdown: Option<oneshot::Sender<()>>,
@@ -285,6 +287,13 @@ pub struct BrokerHandle {
 impl BrokerHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Local-only debug-build diagnostics for P6 failover test failures.
+    #[cfg(debug_assertions)]
+    pub async fn debug_p6_group_session(&self, group_id: &GroupId) -> Option<String> {
+        let service = self.p6_service.as_ref()?;
+        Some(service.session_diagnostics(group_id).await)
     }
 
     /// Executes one bounded P9-D delete-retention attempt. This is an explicit
@@ -821,6 +830,8 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
     };
     let connection_limit = Arc::new(Semaphore::new(config.max_connections));
     let metrics_for_connections = metrics.clone();
+    #[cfg(debug_assertions)]
+    let p6_service_for_debug = p6_service.clone();
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         loop {
@@ -863,6 +874,8 @@ pub async fn start(mut config: BrokerConfig) -> Result<BrokerHandle> {
     Ok(BrokerHandle {
         local_addr,
         state: handle_state,
+        #[cfg(debug_assertions)]
+        p6_service: p6_service_for_debug,
         shutdown: Some(shutdown_tx),
         task,
         metrics_shutdown,

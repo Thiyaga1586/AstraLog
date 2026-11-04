@@ -2242,10 +2242,25 @@ async fn p6_silent_member_gets_fresh_grace_then_times_out_after_coordinator_fail
             Ok(None) => format!("term={current_term} history missing"),
             Err(error) => format!("term={current_term} history read: {error}"),
         };
-        assert!(
-            time::Instant::now() < overall_deadline,
-            "silent-member expiry/activation did not converge after failover: {last_observed}"
-        );
+        if time::Instant::now() >= overall_deadline {
+            let mut diagnostics = Vec::new();
+            #[cfg(debug_assertions)]
+            for (index, broker) in brokers.iter().enumerate() {
+                if let Some(broker) = broker {
+                    diagnostics.push(format!(
+                        "broker={} {}",
+                        index + 1,
+                        broker
+                            .debug_p6_group_session(&group_id)
+                            .await
+                            .unwrap_or_else(|| "P6 unavailable".into())
+                    ));
+                }
+            }
+            panic!(
+                "silent-member expiry/activation did not converge after failover: {last_observed}; local diagnostics={diagnostics:?}"
+            );
+        }
         time::sleep(Duration::from_millis(100)).await;
     }
 

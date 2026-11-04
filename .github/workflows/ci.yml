@@ -23,6 +23,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Run the historically intermittent RF3/group failover gate before the
+      # 16-minute interview benchmarks so a genuine regression fails promptly.
+      # The following full suite still executes all tests without exclusions.
+      - name: P6 failover integration (fast-fail)
+        run: cargo test -p astralog-broker --test p6_routing --all-features --locked -- --test-threads=1
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 

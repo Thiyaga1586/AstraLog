@@ -51,6 +51,9 @@ const PRIVATE_OP_RECOVER_FENCES: u8 = 5;
 const MAX_TRACKED_SESSION_GROUPS: usize = 1_024;
 const MAX_LEADERSHIP_DISCOVERY_GROUPS: usize = MAX_TRACKED_SESSION_GROUPS * 4;
 const LEADERSHIP_DISCOVERY_INTERVAL_MS: u64 = 1_000;
+// An empty committed-history observation is not permanent proof that a shard
+// has no members. Retry at a bounded rate even when the P3 term is unchanged.
+const LEADERSHIP_RECOVERY_RECHECK_MS: u64 = 10_000;
 const LEADERSHIP_REPLAY_BATCH_RECORDS: usize = 256;
 const MAX_LEADERSHIP_DISCOVERY_TASKS: usize = 8;
 const LEADERSHIP_DISCOVERY_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -81,14 +84,31 @@ pub(crate) struct P6Service {
     groups: GroupCoordinatorClient,
     offsets: OffsetCoordinatorClient,
     sessions: Arc<Mutex<BTreeMap<GroupId, SessionEntry>>>,
-    initialized_group_shards: Arc<Mutex<BTreeMap<u32, u64>>>,
+    initialized_group_shards: Arc<Mutex<BTreeMap<u32, ShardRecoveryMark>>>,
     next_leadership_scan_ms: Arc<Mutex<u64>>,
+    #[cfg(debug_assertions)]
+    last_maintenance_error: Arc<Mutex<BTreeMap<GroupId, (u64, PublicError)>>>,
     started_at: Instant,
 }
 
 struct SessionEntry {
     coordinator_epoch: u64,
     tracker: SessionTracker,
+}
+
+#[derive(Clone, Copy)]
+struct ShardRecoveryMark {
+    coordinator_epoch: u64,
+    committed_high_watermark: u64,
+    completed_at_ms: u64,
+}
+
+impl ShardRecoveryMark {
+    fn is_current(self, epoch: u64, high_watermark: u64, now_ms: u64) -> bool {
+        self.coordinator_epoch == epoch
+            && self.committed_high_watermark == high_watermark
+            && now_ms.saturating_sub(self.completed_at_ms) < LEADERSHIP_RECOVERY_RECHECK_MS
+    }
 }
 
 struct CoordinatorContext {
@@ -125,6 +145,8 @@ impl P6Service {
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             initialized_group_shards: Arc::new(Mutex::new(BTreeMap::new())),
             next_leadership_scan_ms: Arc::new(Mutex::new(0)),
+            #[cfg(debug_assertions)]
+            last_maintenance_error: Arc::new(Mutex::new(BTreeMap::new())),
             started_at: Instant::now(),
         }
     }
@@ -145,6 +167,67 @@ impl P6Service {
                         && topic.replication_factor() == Some(descriptor.replication_factor)
                 })
         })
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) async fn session_diagnostics(&self, group_id: &GroupId) -> String {
+        let now_ms = self.now_ms();
+        let shard = group_shard(group_id).ok();
+        let mark = if let Some(shard) = shard {
+            self.initialized_group_shards
+                .lock()
+                .await
+                .get(&shard)
+                .copied()
+        } else {
+            None
+        };
+        let session = self.sessions.lock().await.get(group_id).map(|entry| {
+            format!(
+                "epoch={} tracker={:?}",
+                entry.coordinator_epoch, entry.tracker
+            )
+        });
+        let last_error = self
+            .last_maintenance_error
+            .lock()
+            .await
+            .get(group_id)
+            .copied();
+        let status = if let Some(shard) = shard {
+            if let Some(topic) = self
+                .replication
+                .topology_snapshot()
+                .topic_by_name(GROUPS_INTERNAL_TOPIC_NAME)
+            {
+                time::timeout(
+                    std::time::Duration::from_secs(1),
+                    self.replication.status(topic.topic_id, shard),
+                )
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        format!(
+            "broker={} ready={} now_ms={} shard={:?} shard_mark={:?} local_status={:?} session={:?} last_maintenance_error={:?}",
+            self.local_broker_id,
+            self.ready(),
+            now_ms,
+            shard,
+            mark.map(|m| (
+                m.coordinator_epoch,
+                m.committed_high_watermark,
+                m.completed_at_ms
+            )),
+            status,
+            session,
+            last_error
+        )
     }
 
     pub(crate) async fn join(
@@ -437,7 +520,16 @@ impl P6Service {
         for group_id in group_ids {
             let service = self.clone();
             tasks.spawn(async move {
-                let _ = service.maintain_group(group_id).await;
+                let result = service.maintain_group(group_id.clone()).await;
+                #[cfg(debug_assertions)]
+                {
+                    let mut errors = service.last_maintenance_error.lock().await;
+                    if let Err(error) = result {
+                        errors.insert(group_id, (service.now_ms(), error.error));
+                    } else {
+                        errors.remove(&group_id);
+                    }
+                }
             });
         }
         while tasks.join_next().await.is_some() {
@@ -543,7 +635,9 @@ impl P6Service {
             .await
             .get(&shard)
             .copied()
-            == Some(status.leader_epoch)
+            .is_some_and(|mark| {
+                mark.is_current(status.leader_epoch, status.high_watermark, self.now_ms())
+            })
         {
             return Ok(());
         }
@@ -571,10 +665,14 @@ impl P6Service {
         }
         self.install_new_leader_grace(shard, status.leader_epoch, groups)
             .await?;
-        self.initialized_group_shards
-            .lock()
-            .await
-            .insert(shard, status.leader_epoch);
+        self.initialized_group_shards.lock().await.insert(
+            shard,
+            ShardRecoveryMark {
+                coordinator_epoch: status.leader_epoch,
+                committed_high_watermark: after_replay.high_watermark,
+                completed_at_ms: self.now_ms(),
+            },
+        );
         Ok(())
     }
 
@@ -672,6 +770,11 @@ impl P6Service {
             .keys()
             .filter(|group_id| group_shard(group_id).ok() == Some(shard))
             .filter(|group_id| !groups.contains_key(*group_id))
+            .filter(|group_id| {
+                sessions
+                    .get(*group_id)
+                    .is_some_and(|entry| entry.coordinator_epoch != leader_epoch)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let retained = sessions.len().saturating_sub(stale.len());
@@ -1218,8 +1321,19 @@ impl P6Service {
         let fence = cooperative
             .required_group_fence()
             .map_err(|error| self.cooperative_failure(error, observation, Some(&prepared), None))?;
-        self.route_group_fence(&fence)
-            .await
+        let fence_result = self.route_group_fence(&fence).await;
+        #[cfg(debug_assertions)]
+        if let Err(error) = &fence_result
+            && std::env::var_os("ASTRALOG_P6_DIAG").is_some()
+        {
+            eprintln!(
+                "P6_DIAG phase=route_group_fence broker={} group={} term={} error={error:?}",
+                self.local_broker_id,
+                prepared.group_id.as_str(),
+                observation.hint.coordinator_epoch
+            );
+        }
+        fence_result
             .map_err(|error| self.failure_with_group(error, observation, Some(&prepared), None))?;
         cooperative
             .apply_committed_group_fence(fence)
@@ -1227,10 +1341,22 @@ impl P6Service {
         let activated = cooperative
             .activate_prepared_epoch()
             .map_err(|error| self.cooperative_failure(error, observation, Some(&prepared), None))?;
-        let committed = self
+        let commit_result = self
             .groups
             .commit(observation.hint.coordinator_epoch, activated)
-            .await
+            .await;
+        #[cfg(debug_assertions)]
+        if let Err(error) = &commit_result
+            && std::env::var_os("ASTRALOG_P6_DIAG").is_some()
+        {
+            eprintln!(
+                "P6_DIAG phase=activate_group_epoch broker={} group={} term={} error={error:?}",
+                self.local_broker_id,
+                prepared.group_id.as_str(),
+                observation.hint.coordinator_epoch
+            );
+        }
+        let committed = commit_result
             .map_err(|error| self.group_runtime_failure(error, observation, Some(&prepared), None))?
             .record;
         if cooperative.current() != &committed {
@@ -2401,5 +2527,18 @@ mod leadership_recovery_tests {
             2,
             None,
         ));
+    }
+
+    #[test]
+    fn shard_recovery_mark_retries_committed_progress_and_stale_empty_scans() {
+        let first = ShardRecoveryMark {
+            coordinator_epoch: 2,
+            committed_high_watermark: 0,
+            completed_at_ms: 1_000,
+        };
+        assert!(first.is_current(2, 0, 1_001));
+        assert!(!first.is_current(3, 0, 1_001));
+        assert!(!first.is_current(2, 1, 1_001));
+        assert!(!first.is_current(2, 0, 1_000 + LEADERSHIP_RECOVERY_RECHECK_MS));
     }
 }
