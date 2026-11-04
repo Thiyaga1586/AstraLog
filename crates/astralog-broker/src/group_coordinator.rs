@@ -18,7 +18,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::replication::{ReplicationClient, RoutingError};
+use crate::{
+    coordinator_queue::{self, Queued},
+    replication::{ReplicationClient, RoutingError},
+};
 
 const RECOVERY_REQUEST_BYTES: usize = MAX_GROUP_ID_LEN + 128;
 
@@ -176,17 +179,18 @@ impl GroupCoordinatorRuntime {
             replay_batch_records: config.replay_batch_records,
         };
         let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut shutdown_rx => break,
-                    command = control_rx.recv() => {
-                        let Some(command) = command else { break };
-                        worker.handle(command).await;
-                    }
-                    command = mutation_rx.recv() => {
-                        let Some(command) = command else { break };
-                        worker.handle(command).await;
+            let mut consecutive_controls = 0_u8;
+            while let Some(command) = coordinator_queue::next(
+                &mut shutdown_rx,
+                &mut control_rx,
+                &mut mutation_rx,
+                &mut consecutive_controls,
+            )
+            .await
+            {
+                match command {
+                    Queued::Control(command) | Queued::Mutation(command) => {
+                        worker.handle(command).await
                     }
                 }
             }

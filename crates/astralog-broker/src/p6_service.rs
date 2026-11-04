@@ -213,8 +213,27 @@ impl P6Service {
         } else {
             None
         };
+        let offsets_status = if let Some(shard) = shard {
+            if let Some(topic) = self
+                .replication
+                .topology_snapshot()
+                .topic_by_name(OFFSETS_INTERNAL_TOPIC_NAME)
+            {
+                time::timeout(
+                    std::time::Duration::from_secs(1),
+                    self.replication.status(topic.topic_id, shard),
+                )
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         format!(
-            "broker={} ready={} now_ms={} shard={:?} shard_mark={:?} local_status={:?} session={:?} last_maintenance_error={:?}",
+            "broker={} ready={} now_ms={} shard={:?} shard_mark={:?} group_status={:?} offsets_status={:?} session={:?} last_maintenance_error={:?}",
             self.local_broker_id,
             self.ready(),
             now_ms,
@@ -225,6 +244,7 @@ impl P6Service {
                 m.completed_at_ms
             )),
             status,
+            offsets_status,
             session,
             last_error
         )
@@ -1140,6 +1160,13 @@ impl P6Service {
         let observation = match self.offsets.observe(group_id.clone()).await {
             Ok(observation) => observation,
             Err(error) => {
+                #[cfg(debug_assertions)]
+                if std::env::var_os("ASTRALOG_P6_DIAG").is_some() {
+                    eprintln!(
+                        "P6_DIAG phase=offset_observe broker={} op={} error={error:?}",
+                        self.local_broker_id, operation,
+                    );
+                }
                 let (public, leader, epoch) = offset_error(error);
                 return private_error_response(frame, public, leader, epoch);
             }
@@ -1163,6 +1190,13 @@ impl P6Service {
                 payload,
             ),
             Err(error) => {
+                #[cfg(debug_assertions)]
+                if std::env::var_os("ASTRALOG_P6_DIAG").is_some() {
+                    eprintln!(
+                        "P6_DIAG phase=offset_execute broker={} op={} term={} error={error:?}",
+                        self.local_broker_id, operation, observation.leader_epoch,
+                    );
+                }
                 let (public, leader, epoch) = offset_error(error);
                 private_error_response(frame, public, leader, epoch)
             }
@@ -1864,8 +1898,18 @@ impl P6Service {
                     }
                 }
                 Ok((PublicError::BrokerBusy, _)) => continue,
+                // Group/owner fences are uniquely keyed and the offsets worker
+                // first reconciles their committed state. Re-dispatching the
+                // exact same fence after an ambiguous response is therefore
+                // safe. Non-idempotent CommitOffsets remains single-shot.
+                Ok((PublicError::RequestTimeout, _)) if mutation && idempotent_mutation => {
+                    continue;
+                }
                 Ok((PublicError::RequestTimeout, _)) if mutation && !idempotent_mutation => {
                     return Err(PublicError::RequestTimeout);
+                }
+                Ok((PublicError::BrokerNotAvailable, _)) if !mutation || idempotent_mutation => {
+                    continue;
                 }
                 Ok((error, _)) => return Err(error),
                 Err(sent) if sent && mutation && !idempotent_mutation => {
@@ -2012,6 +2056,21 @@ impl P6Service {
         group: Option<&GroupRecordV1>,
         member_id: Option<MemberId>,
     ) -> P6Failure {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ASTRALOG_P6_DIAG").is_some()
+            && matches!(
+                error,
+                GroupCoordinatorError::MutationAmbiguous { .. }
+                    | GroupCoordinatorError::Replication(_)
+            )
+        {
+            eprintln!(
+                "P6_DIAG phase=group_runtime broker={} term={} group={:?} error={error:?}",
+                self.local_broker_id,
+                observation.hint.coordinator_epoch,
+                group.map(|record| record.group_id.as_str()),
+            );
+        }
         let public = match error {
             GroupCoordinatorError::NotCoordinator { .. } => PublicError::NotLeader,
             GroupCoordinatorError::MutationAmbiguous { .. } => PublicError::RequestTimeout,

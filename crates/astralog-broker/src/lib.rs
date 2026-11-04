@@ -2,6 +2,7 @@
 
 mod catalog;
 mod controller;
+mod coordinator_queue;
 mod error;
 mod group_coordinator;
 mod load_shaping;

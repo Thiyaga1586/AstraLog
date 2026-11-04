@@ -27,7 +27,9 @@ jobs:
       # 16-minute interview benchmarks so a genuine regression fails promptly.
       # The following full suite still executes all tests without exclusions.
       - name: P6 failover integration (fast-fail)
-        run: cargo test -p astralog-broker --test p6_routing --all-features --locked -- --test-threads=1
+        env:
+          ASTRALOG_P6_DIAG: "1"
+        run: cargo test -p astralog-broker --test p6_routing --all-features --locked -- --nocapture --test-threads=1
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 
