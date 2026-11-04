@@ -37,6 +37,11 @@ jobs:
         env:
           ASTRALOG_P9F_DIAG: "1"
         run: cargo test -p astralog-broker --test p5_dynamic --all-features --locked -- p9f_rf3_checkpoint_survives_failover_and_preserves_exact_retry --exact --nocapture --test-threads=1
+      # The controller health readiness test previously aged a heartbeat by
+      # 1,000 logical ticks per polling cycle even though its unavailable
+      # threshold is only 10. Keep its exact health/producer test early.
+      - name: P7 controller health and producer integration (fast-fail)
+        run: cargo test -p astralog-broker --test p7_runtime --all-features --locked -- --nocapture --test-threads=1
       - name: Tests
         env:
           ASTRALOG_P9F_DIAG: "1"

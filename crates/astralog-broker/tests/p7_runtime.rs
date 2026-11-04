@@ -153,6 +153,32 @@ async fn current_leader(
     }
 }
 
+// Initialize the detector on the *current* leader. A leader change resets its
+// volatile heartbeat observations; retry only leadership/queue races rather
+// than ignoring an uninstalled tick and waiting for impossible liveness.
+async fn detector_tick(
+    nodes: &BTreeMap<ControllerNodeId, ControllerNodeHandle>,
+    tick: u64,
+) -> ControllerNodeId {
+    let deadline = time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let leader = current_leader(nodes).await;
+        match nodes[&leader].failure_detector_tick(tick).await {
+            Ok(()) => return leader,
+            Err(
+                astralog_controller::ControllerError::NotLeader { .. }
+                | astralog_controller::ControllerError::Busy(_),
+            ) => {}
+            Err(error) => panic!("P7-F/H failure-detector tick failed: {error}"),
+        }
+        assert!(
+            time::Instant::now() < deadline,
+            "P7-F/H failure-detector leader never accepted initial tick"
+        );
+        time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn mutate(
     nodes: &BTreeMap<ControllerNodeId, ControllerNodeHandle>,
     command: ControllerCommand,
@@ -416,23 +442,24 @@ async fn p7_controller_authority_binds_internal_idempotent_runtime() {
     };
 
     let healthy_deadline = time::Instant::now() + Duration::from_secs(10);
-    let mut detector_tick = 1_000_u64;
     loop {
-        let leader = current_leader(&controllers).await;
-        let _ = controllers[&leader]
-            .failure_detector_tick(detector_tick)
-            .await;
-        detector_tick = detector_tick.saturating_add(1_000);
-        if controllers[&leader]
-            .broker_liveness(1)
-            .await
+        // This integration only needs an initialized detector clock to prove
+        // the broker actually heartbeats. Advancing by 1,000 logical ticks on
+        // every 25-ms poll previously aged a healthy heartbeat beyond the
+        // detector's 10-tick unavailable threshold immediately. Reinitialize
+        // the fixed tick on a newly elected controller instead of simulating failure
+        // detector time passage unrelated to real broker heartbeats.
+        let leader = detector_tick(&controllers, 1_000).await;
+        let observed = controllers[&leader].broker_liveness(1).await;
+        if observed
+            .as_ref()
             .is_ok_and(|observation| observation.state == BrokerLivenessState::Healthy)
         {
             break;
         }
         assert!(
             time::Instant::now() < healthy_deadline,
-            "P7-F broker never became healthy at the controller"
+            "P7-F broker never became healthy at the controller: last observation={observed:?}"
         );
         time::sleep(Duration::from_millis(25)).await;
     }
@@ -688,21 +715,22 @@ async fn p7_public_rf1_init_produce_restart_and_lost_response_retry_commit_once(
     };
 
     let healthy_deadline = time::Instant::now() + Duration::from_secs(10);
-    let mut detector_tick = 1_000_u64;
     loop {
-        let leader = current_leader(&controllers).await;
-        let _ = controllers[&leader]
-            .failure_detector_tick(detector_tick)
-            .await;
-        detector_tick = detector_tick.saturating_add(1_000);
-        if controllers[&leader]
-            .broker_liveness(1)
-            .await
+        // P7-H readiness must observe a real heartbeat at a fixed logical
+        // time. Advancing 1,000 ticks per poll made every prior heartbeat
+        // immediately unavailable, even if the broker was functioning.
+        let leader = detector_tick(&controllers, 1_000).await;
+        let observed = controllers[&leader].broker_liveness(1).await;
+        if observed
+            .as_ref()
             .is_ok_and(|observation| observation.state == BrokerLivenessState::Healthy)
         {
             break;
         }
-        assert!(time::Instant::now() < healthy_deadline);
+        assert!(
+            time::Instant::now() < healthy_deadline,
+            "P7-H broker never became healthy at the controller: last observation={observed:?}"
+        );
         time::sleep(Duration::from_millis(25)).await;
     }
     let created = create_topic(&controllers).await;
