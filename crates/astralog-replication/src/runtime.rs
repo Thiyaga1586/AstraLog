@@ -540,6 +540,23 @@ impl ReplicatedPartition {
         if committed == LogIndex::ZERO {
             return Ok(committed);
         }
+        // A cleaner can be retried at the same committed boundary after its
+        // previous snapshot was already persisted. Raft correctly rejects a
+        // duplicate RequestSnapshot(index), but retention needs an idempotent
+        // no-op when that exact boundary is already covered by durable state.
+        if committed <= self.core.snapshot().last_included_index {
+            return Ok(committed);
+        }
+        // The durable commit index can briefly lead state-machine application.
+        // Never request a snapshot of an unapplied prefix or silently treat
+        // that prefix as cleaned. Let the bounded maintenance caller retry.
+        if committed > self.core.volatile_state().last_applied
+            || committed > self.core.volatile_state().commit_index
+        {
+            return Err(ReplicationError::Busy(
+                "P9 snapshot commit is not yet applied",
+            ));
+        }
         self.handle(Input::RequestSnapshot(committed), now_ms)?;
         Ok(committed)
     }
@@ -5024,6 +5041,64 @@ mod tests {
             receipt.raft_index
         );
         assert!(replica.persistence_group_metrics().physical_syncs >= 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn p9_retention_snapshot_reuses_durable_floor_and_advances_after_new_commit() {
+        let (dir, mut replica) =
+            grouped_single("p9-repeat-retention-snapshot", 4, 1024 * 1024, 1000);
+        let first = replica
+            .propose_records(vec![record(b"first")], AckRequirement::Quorum, 1)
+            .unwrap();
+        replica.flush_persistence(2).unwrap();
+        assert_eq!(
+            replica.proposal_outcome(first.proposal_id),
+            Some(ProposalOutcome::QuorumCommitted)
+        );
+
+        let epoch = replica.leader_epoch();
+        assert_eq!(
+            replica
+                .snapshot_committed_prefix_for_retention(epoch, 3)
+                .unwrap(),
+            first.raft_index
+        );
+        assert_eq!(
+            replica.core.snapshot().last_included_index,
+            first.raft_index
+        );
+        // Same committed boundary, repeated cleaning: no new snapshot build.
+        assert_eq!(
+            replica
+                .snapshot_committed_prefix_for_retention(epoch, 4)
+                .unwrap(),
+            first.raft_index
+        );
+        assert_eq!(
+            replica.core.snapshot().last_included_index,
+            first.raft_index
+        );
+
+        let second = replica
+            .propose_records(vec![record(b"second")], AckRequirement::Quorum, 5)
+            .unwrap();
+        replica.flush_persistence(6).unwrap();
+        assert_eq!(
+            replica.proposal_outcome(second.proposal_id),
+            Some(ProposalOutcome::QuorumCommitted)
+        );
+        assert!(second.raft_index > first.raft_index);
+        assert_eq!(
+            replica
+                .snapshot_committed_prefix_for_retention(epoch, 7)
+                .unwrap(),
+            second.raft_index
+        );
+        assert_eq!(
+            replica.core.snapshot().last_included_index,
+            second.raft_index
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
