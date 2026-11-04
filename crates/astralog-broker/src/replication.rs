@@ -22,13 +22,13 @@ use astralog_replication::{
     ControllerAuthorityEvidence, GroupKey, IdempotentProduceError, IdempotentProposalDisposition,
     MembershipObservation, PeerDescriptor, PeerInboundFrame, PeerTransportConfig,
     PeerTransportHandle, PeerTransportSender, ProposalOutcome, RebootstrapLimits,
-    RebootstrapLimitsV2, ReplicaLimits, ReplicatedPartition, TransportLimits, VoterIdentity,
-    decode_rebootstrap_package, decode_rebootstrap_package_v2, encode_rebootstrap_package,
-    encode_rebootstrap_package_v2, start_peer_transport,
+    RebootstrapLimitsV2, ReplicaLimits, ReplicatedPartition, ReplicationError, TransportLimits,
+    VoterIdentity, decode_rebootstrap_package, decode_rebootstrap_package_v2,
+    encode_rebootstrap_package, encode_rebootstrap_package_v2, start_peer_transport,
 };
 use astralog_storage::{
     CompactionLimits, CompactionOutcome, CompactionPlan, Compression, DataRecord,
-    DeleteRetentionPlan, PartitionLogConfig, StoredRecord, TombstoneRemovalGate,
+    DeleteRetentionPlan, PartitionLogConfig, StorageError, StoredRecord, TombstoneRemovalGate,
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
@@ -2355,9 +2355,9 @@ fn handle_client_command(
                     return Ok(());
                 }
                 Ok(Some(receipt)) => receipt,
-                Err(_) => {
+                Err(error) => {
                     let _ = response.send(Err(RoutingError::from_status(
-                        PublicError::StorageError,
+                        p9_maintenance_public_error("checkpoint", &error),
                         partition_status(replica),
                     )));
                     return Ok(());
@@ -2408,8 +2408,11 @@ fn handle_client_command(
             let result = replica
                 .snapshot_committed_prefix_for_retention(expected_epoch, now_ms())
                 .map(|_| ())
-                .map_err(|_| {
-                    RoutingError::from_status(PublicError::StorageError, partition_status(replica))
+                .map_err(|error| {
+                    RoutingError::from_status(
+                        p9_maintenance_public_error("snapshot", &error),
+                        partition_status(replica),
+                    )
                 });
             let _ = response.send(result);
         }
@@ -2438,9 +2441,9 @@ fn handle_client_command(
                         leader_epoch: status.leader_epoch,
                     }));
                 }
-                Err(_) => {
+                Err(error) => {
                     let _ = response.send(Err(RoutingError::from_status(
-                        PublicError::StorageError,
+                        p9_maintenance_public_error("plan_compaction", &error),
                         partition_status(replica),
                     )));
                 }
@@ -2498,9 +2501,9 @@ fn handle_client_command(
                 now_ms(),
             ) {
                 Ok(receipt) => receipt,
-                Err(_) => {
+                Err(error) => {
                     let _ = response.send(Err(RoutingError::from_status(
-                        PublicError::StorageError,
+                        p9_maintenance_public_error("execute_compaction", &error),
                         partition_status(replica),
                     )));
                     return Ok(());
@@ -3304,6 +3307,45 @@ fn transport_voter_quorum_congested(
     !effective.has_voter_quorum(&admitted)
 }
 
+// P9 maintenance can lose its *observation* while a valid leader finishes
+// committing a checkpoint or other maintenance entry. That is not evidence of
+// damaged storage. Only explicitly classified readiness and stale-plan failures
+// are retryable; unknown storage errors remain fatal to the caller.
+fn p9_maintenance_public_error(stage: &'static str, error: &ReplicationError) -> PublicError {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ASTRALOG_P9F_DIAG").is_some() {
+        eprintln!("P9F_DIAG stage={stage} internal_error={error:?}");
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = stage;
+
+    match error {
+        ReplicationError::Busy(_) => PublicError::BrokerNotAvailable,
+        ReplicationError::Invalid(
+            "P9 retention snapshot is fenced by leader epoch"
+            | "P9 producer checkpoint proposal is fenced by leader epoch",
+        ) => PublicError::StaleEpoch,
+        ReplicationError::Storage(StorageError::InvalidFormat(reason))
+            if matches!(
+                *reason,
+                "P9-E cleaner plan policy epoch is stale"
+                    | "P9-E cleaner plan snapshot floor is stale"
+                    | "P9-E cleaner plan maintenance epoch is stale"
+                    | "P9-E cleaner plan log-start maintenance state is stale"
+                    | "P9-G cleaner plan compaction-safe maintenance state is stale"
+                    | "P9-E cleaner plan manifest generation is stale"
+                    | "P9-E cleaner active segment identity changed"
+                    | "P9-E cleaner source is no longer in the authoritative manifest"
+                    | "P9-E cleaner history changed after planning"
+                    | "P9-E cleaner publication metadata epoch is stale"
+            ) =>
+        {
+            PublicError::StaleEpoch
+        }
+        _ => PublicError::StorageError,
+    }
+}
+
 #[cfg(test)]
 mod transport_quorum_admission_tests {
     use super::*;
@@ -3348,6 +3390,62 @@ mod transport_quorum_admission_tests {
             &joint,
             &BTreeSet::from([voter(1), voter(2)]),
         ));
+    }
+}
+
+#[cfg(test)]
+mod p9_maintenance_error_tests {
+    use super::*;
+
+    #[test]
+    fn only_not_ready_and_superseded_plans_are_retryable() {
+        assert_eq!(
+            p9_maintenance_public_error(
+                "checkpoint",
+                &ReplicationError::Busy("current-term leader barrier is not committed")
+            ),
+            PublicError::BrokerNotAvailable
+        );
+        assert_eq!(
+            p9_maintenance_public_error(
+                "snapshot",
+                &ReplicationError::Invalid("P9 retention snapshot is fenced by leader epoch")
+            ),
+            PublicError::StaleEpoch
+        );
+        for reason in [
+            "P9-E cleaner plan snapshot floor is stale",
+            "P9-E cleaner plan maintenance epoch is stale",
+            "P9-E cleaner history changed after planning",
+            "P9-E cleaner publication metadata epoch is stale",
+        ] {
+            assert_eq!(
+                p9_maintenance_public_error(
+                    "execute_compaction",
+                    &ReplicationError::Storage(StorageError::InvalidFormat(reason))
+                ),
+                PublicError::StaleEpoch
+            );
+        }
+        assert_eq!(
+            p9_maintenance_public_error(
+                "plan_compaction",
+                &ReplicationError::Storage(StorageError::InvalidFormat(
+                    "P9-F cannot compact P7 producer source without a snapshot-safe covering checkpoint"
+                ))
+            ),
+            PublicError::StorageError,
+            "an unsafe producer checkpoint must never be mistaken for a stale plan"
+        );
+        assert_eq!(
+            p9_maintenance_public_error(
+                "execute_compaction",
+                &ReplicationError::Storage(StorageError::Corruption {
+                    reason: "malformed segment".into()
+                })
+            ),
+            PublicError::StorageError
+        );
     }
 }
 

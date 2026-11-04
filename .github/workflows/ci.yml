@@ -30,7 +30,16 @@ jobs:
         env:
           ASTRALOG_P6_DIAG: "1"
         run: cargo test -p astralog-broker --test p6_routing --all-features --locked -- --nocapture --test-threads=1
+      # P9-F recently failed late in the full suite with a transient error
+      # previously flattened to StorageError. Test it early and retain the
+      # internal error class if a real corruption/safety failure recurs.
+      - name: P9-F producer checkpoint integration (fast-fail)
+        env:
+          ASTRALOG_P9F_DIAG: "1"
+        run: cargo test -p astralog-broker --test p5_dynamic --all-features --locked -- p9f_rf3_checkpoint_survives_failover_and_preserves_exact_retry --exact --nocapture --test-threads=1
       - name: Tests
+        env:
+          ASTRALOG_P9F_DIAG: "1"
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 
   frontend:
