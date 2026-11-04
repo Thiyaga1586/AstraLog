@@ -1,604 +1,362 @@
 # AstraLog
 
-**Fault-Tolerant Distributed Event Streaming Infrastructure**
+### A distributed event log, built from first principles in Rust
 
-## Control Center: local interactive dashboard
+**AstraLog** is a Kafka-inspired, fault-tolerant event-streaming engine built to explore the systems problems behind a message broker: durable storage, distributed consensus, leader election, client retries, ordered consumption, rebalancing, and crash recovery.
 
-AstraLog now includes a **read-only React dashboard** with an interactive React Flow broker topology, partition explorer, architecture diagrams, and Recharts benchmark comparisons. Live views come from a separate loopback-only Rust and Axum adapter that queries actual AstraLog Metadata V0. The optional preview is always labeled as sample data. The benchmark panels use historical evidence, not invented live metrics.
+Applications publish records to **topics**. Topics are split into **partitions**. Each partition owns an ordered log and, when replicated, an independent **Raft consensus group**. A separate controller Raft group owns cluster metadata rather than sitting on the hot data path.
+
+> **Project status:** Working, tested **local engineering/portfolio prototype**, not a production-ready Kafka replacement. Broker networking currently permits **loopback-only** connections and does not implement client TLS, authentication, or authorization. P9 retention work has an unqualified P9-G boundary; P10 queues and full P11/P12 production operations are not finished. See [current state](docs/CURRENT_STATE.md) and [security scope](SECURITY.md).
+
+[![AstraLog CI](https://github.com/Thiyaga1586/AstraLog/actions/workflows/ci.yml/badge.svg)](https://github.com/Thiyaga1586/AstraLog/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+**Jump to:** [Architecture](#system-architecture) · [Write path](#1-producing-a-record) · [Read path](#2-reading-committed-data) · [Failure recovery](#what-happens-when-things-fail) · [Stack](#technology-stack) · [Run locally](#run-it-on-your-laptop) · [Roadmap](#limitations-and-future-work)
+
+---
+
+## Why build AstraLog?
+
+Imagine an online store publishing an `OrderCreated` event. The payments, inventory, and analytics services need to process that event independently. They should be able to resume from a remembered position and should not lose a **committed** event just because a broker process stops.
+
+AstraLog implements the key machinery itself instead of running Kafka, Pulsar, ZooKeeper, etcd, or an external storage service behind a custom UI.
+
+| Concept | What it means here |
+| --- | --- |
+| **Producer** | An application sending records into the log |
+| **Topic** | A named event stream, for example `orders` |
+| **Partition** | One ordered lane within a topic; ordering is **per partition**, not global |
+| **Leader / follower** | A partition's current Raft leader accepts writes; voting followers replicate its log |
+| **Quorum** | A majority of voters; for three voting replicas, **2 of 3** |
+| **Controller** | The separate consensus-backed authority for broker identities, topics, placement, feature levels, and movement intent |
+| **Consumer offset** | A bookmark indicating progress through a partition |
+| **Producer ID, epoch, sequence** | The identity and ordering information used for supported idempotent retries |
+
+## System architecture
+
+AstraLog deliberately separates **control plane** decisions ("which brokers and partitions exist?") from **data plane** traffic ("append this record; fetch committed records").
+
+```mermaid
+flowchart TB
+    classDef ctrl fill:#e8edff,stroke:#697dd5,color:#172451
+    classDef broker fill:#e8f8f1,stroke:#3d9673,color:#153c2c
+    classDef storage fill:#fff4e5,stroke:#c99138,color:#553b11
+
+    A["Application: producer / consumer"] -->|"Bootstrap metadata (binary TCP)"| R["Client-side metadata and leader cache"]
+    R -->|"Produce / Fetch direct to leader"| L["Broker A · partition leader"]
+    R -.->|"Reroute after election"| B["Broker B"]
+    R -.->|"Reroute after election"| C["Broker C"]
+    L -->|"Raft AppendEntries"| B
+    L -->|"Raft AppendEntries"| C
+    L --- D1[("Local segmented log")]
+    B --- D2[("Local segmented log")]
+    C --- D3[("Local segmented log")]
+
+    subgraph CP["Control plane · independent Raft group"]
+        C1["Controller 1"] <--> C2["Controller 2"]
+        C2 <--> C3["Controller 3"]
+        C1 <--> C3
+    end
+    CP -->|"Committed assignments, broker identity, feature level"| L
+    CP -->|"Metadata updates"| B
+    CP -->|"Metadata updates"| C
+
+    class C1,C2,C3 ctrl
+    class L,B,C broker
+    class D1,D2,D3 storage
+```
+
+**The important distinction:** The controller commits *which replicas should host a partition*. It does not arbitrarily appoint the live leader. The **partition's own Raft group** elects its leader. Every partition can have a different leader, term, and failure domain. The three-broker picture above illustrates **one** RF3 partition; other partitions have independent Raft logs.
+
+AstraLog uses **broker-local disks**. There is no separate storage-cluster dependency and no mandatory proxy in front of every request.
+
+### What happens inside a broker?
 
 ```mermaid
 flowchart LR
-    UI[React, TypeScript, Vite] -->|HTTP GET, localhost| A[Axum read-only adapter]
-    A -->|Metadata V0| B[AstraLog broker]
-    B -->|partition leaders and replicas| A
-    UI -->|topology| RF[React Flow]
-    UI -->|historical benchmarks| RC[Recharts]
+    TCP["Bounded, versioned binary TCP"] --> ADMIT["Validation, quotas, dispatch"]
+    ADMIT --> ACT["Partition runtime / actor"]
+    ACT --> RAFT["Deterministic Raft core"]
+    RAFT -->|"Persist effects"| PERSIST["Persistence adapter"]
+    PERSIST --> DISK[("Segment files + indexes + manifests")]
+    RAFT -->|"Send effects"| PEERS["Replica transport"]
+    ACT -->|"Committed results"| ADMIT
 ```
 
-Run the disposable real RF3 local demo and UI in three **Windows CMD** windows:
+- **Protocol layer:** Length-prefixed framed requests, checked sizes, correlation IDs, API versions, and bounded parsing.
+- **Consensus layer:** A deterministic Raft engine emits effects such as *persist*, *send*, and *apply*. It is not the disk or network implementation.
+- **Persistence layer:** Carries out durable effects, maintains checksummed segmented log files, and reconstructs state after restart.
+- **Runtime layer:** Connects network requests to partition actors and coordinates backpressure, replication, acknowledgments, and recovery.
+
+### The design choices, not just the feature list
+
+| Decision | Why it matters | Trade-off |
+| --- | --- | --- |
+| **Raft per partition** | Independent order and independent leader failover | Many consensus groups need bounded scheduling and transport |
+| **Separate metadata Raft** | Metadata has one durable authority without requiring controller consensus on every read/write | Another quorum to operate and recover |
+| **Direct client-to-leader routing** | Avoids a mandatory forwarding hop on each request | Clients must refresh stale routes |
+| **Custom binary TCP** | Makes framing, compatibility, limits, and ambiguous network outcomes visible | No built-in gRPC/HTTP security ecosystem |
+| **Local segmented storage** | Direct control of disk, CRC checks, indexes, retention, and replay | Host filesystem durability needs careful qualification |
+| **Fail closed on uncertainty** | A failed disk write or missing quorum does not become a fabricated success | Some operations reject or pause rather than remain available |
+
+## How data flows
+
+### 1. Producing a record
+
+For a typical **`acks=quorum`** write, the client discovers the partition leader, the leader proposes the record, followers persist the replicated entry, and a Raft majority authorizes commit. Only then does a quorum-acknowledged write return success.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Producer / Rust client
+    participant L as Partition leader
+    participant B as Voting follower B
+    participant C as Voting follower C
+    participant S as Durable local storage
+
+    P->>L: Produce(topic, partition, records, acks=quorum)
+    L->>L: Validate epoch, sequence, limits, leader term
+    L->>S: Persist required Raft/log effects
+    L->>B: AppendEntries
+    L->>C: AppendEntries
+    B->>B: Persist entry before durable acknowledgment
+    B-->>L: Append response
+    Note over L,B: Majority of 3 voters reached
+    L->>L: Advance commit and apply under Raft rules
+    L-->>P: Committed offsets / success
+```
+
+**Acknowledgment is an explicit contract, not an all-or-nothing claim:**
+
+| Mode | What it means | Failure caveat |
+| --- | --- | --- |
+| `acks=0` | No response required | No delivery or durability promise |
+| `acks=leader` | Leader-local durable acceptance | An uncommitted record can be lost after leader failure |
+| `acks=quorum` | Raft majority-committed record | Preserved across legal minority failures, assuming the storage durability model holds |
+
+Clients choose a partition by stable key hashing (or sticky behavior for eligible unkeyed batches), cache broker metadata, and can refresh routing after a leader change. Supported producer V1 retries keep the **same producer identity, epoch, sequence, and encoded request** so a lost acknowledgment does not cause a duplicate logical append within the retained deduplication contract.
+
+### 2. Reading committed data
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Consumer / Rust client
+    participant M as Broker metadata
+    participant L as Current partition leader
+    participant D as Segmented storage
+
+    C->>M: Discover topic partitions and leaders
+    M-->>C: Leader routing information
+    C->>L: Fetch(partition, starting offset, limits)
+    L->>L: Enforce committed visibility
+    L->>D: Bounded scan / index lookup
+    D-->>L: Readable committed records
+    L-->>C: Records, offsets, metadata
+    Note over C,L: Optional bounded long-poll waits for more data
+```
+
+A follower may hold **durable but uncommitted** bytes; that is not permission to expose them in a normal committed Fetch. When a leader changes, uncommitted suffixes can be reconciled. Committed history remains the safety boundary. Logical stream offsets are **not the same as Raft indexes**, and retained-history compaction can leave gaps without renumbering records.
+
+### 3. Consumer groups and offsets
+
+Consumer groups distribute partition ownership across readers. AstraLog implements deterministic **uniform-sticky assignment** and cooperative transitions rather than blindly reassigning every partition at once.
+
+```mermaid
+flowchart LR
+    JOIN["Members join / heartbeat"] --> GROUP["Durable group coordinator"]
+    GROUP --> PREP["Prepare new group epoch"]
+    PREP --> GF["Commit offset-group fence"]
+    GF --> REV["Old owner revokes and acknowledges"]
+    REV --> OF["Commit offset-owner fence"]
+    OF --> NEW["Activate new owner"]
+    NEW --> OFFSET["Owner commits its offset"]
+```
+
+The coordinator uses the current Raft leader for a shard of `__astralog_groups`; offsets live in separately replicated `__astralog_offsets` shards. **Group epoch and ownership fences** prevent stale owners from committing offsets after handoff. An ambiguous mutation such as a timed-out join is **not blindly retried**; it requires authoritative reconciliation. These semantics do **not** make arbitrary external database side effects exactly once.
+
+### 4. Storage, snapshots, and retention
+
+```mermaid
+flowchart LR
+    IN["Committed logical records"] --> SEG["Append-only, CRC-checked segments"]
+    SEG --> IDX["Indexes + recovery scan"]
+    SEG --> SNAP["Raft / producer snapshots"]
+    SEG --> COW["Eligible copy-on-write retention / keyed compaction"]
+    COW --> MAN["Publish validated manifest generation"]
+    MAN --> LIVE["Retained readable history"]
+    SNAP -.->|"Committed-prefix and safety fences"| COW
+```
+
+- **Recovery:** Scan bounded on-disk structures, reject invalid committed data, rebuild derived indexes, and restore Raft and producer state from durable evidence.
+- **Compression and batching:** Client-side bounded accumulators; `none`, LZ4, or Zstandard on supported topic/storage paths; group commit and follower pipelining.
+- **Retention:** Advance the readable log start and reclaim only eligible files.
+- **Keyed compaction:** Build replacement segments **copy-on-write** and publish a validated manifest so interrupted work cannot expose a half-written file set. Original logical offsets remain stable.
+- **Producer-state safety:** Historical data needed to reconstruct idempotent retry results cannot be reclaimed until the relevant committed producer checkpoint/snapshot gates permit it.
+
+**Qualification boundary:** P9-G's coordinated cleaner-progress and retained-history V2 rebootstrap work is a **candidate, not yet fully qualified**. P9-H/I cleaner pressure and phase closure remain outstanding. See [P9-G evidence](docs/P9_G_CLOSURE_REPORT.md).
+
+## What happens when things fail?
+
+| Event | Expected response and correctness rule |
+| --- | --- |
+| **Partition leader crashes after quorum commit** | Remaining voters can elect a successor, preserve the committed prefix, and resume writes after establishing leader readiness. Clients rediscover the leader. |
+| **Leader crashes with an uncommitted suffix** | New term can repair/truncate conflicting uncommitted entries; never pretend leader-only acceptance was quorum-committed. |
+| **One voter isolated in RF3** | The remaining **two** can still make a majority. The isolated minority cannot independently commit. Losing two voters prevents new quorum writes. |
+| **A Produce response is lost** | The outcome may be ambiguous. Idempotent V1 retries replay the exact identity/sequence/body and can return the original committed offsets; anonymous non-idempotent requests are not automatically safe to replay. |
+| **Controller leader crashes** | Controller Raft elects a successor; committed placement and metadata survive. Already-authorized data traffic need not query the controller on every operation. |
+| **Consumer coordinator fails** | A new group-shard leader replays committed membership, grants a fresh term-scoped session grace, and continues fence-driven reassignment rather than guessing ownership. |
+| **Replica falls behind / rejoins** | Raft catch-up and authorized snapshot/rebootstrap paths restore eligible state. An obsolete snapshot cannot overwrite an already committed prefix. |
+| **Network or queue overload** | Strict limits, reserved control capacity, quota-based rejection, and throttle signals prevent unbounded buffering; safety takes precedence over accepting more work. |
+| **Corrupted durable bytes** | Checksums and consistency checks detect invalid state; the system must not silently rewrite committed history as healthy. |
+
+**What this does not prove:** process-kill and controlled fault tests are not a physical power cut, sustained WAN partition test, disk-full chaos campaign, or formal proof of every deployed execution. On Windows, the filesystem directory-sync boundary is specifically **not** certified for sudden power-loss durability. See [engineering invariants](docs/INVARIANTS.md), [failure tests](docs/P5_FAILURE_REPORT.md), and [security notes](SECURITY.md).
+
+## Technology stack
+
+| Layer | Tools / libraries actually used | Where to look |
+| --- | --- | --- |
+| Core server | **Rust 2024**, pinned **Rust 1.98.1**, Tokio async runtime | [Broker](crates/astralog-broker/src), [toolchain](rust-toolchain.toml) |
+| Consensus | Custom deterministic **Raft**, leader election, log replication, joint membership and snapshots | [Raft](crates/astralog-raft/src) |
+| Durable log | Custom segmented WAL, CRC32C, indexes, manifests, copy-on-write compaction | [Storage](crates/astralog-storage/src) |
+| Replication | Partition Raft runtimes, persistence effects, broker-to-broker transport | [Replication](crates/astralog-replication/src) |
+| Cluster metadata | Independent controller Raft, placement, identity/epoch fencing, movement intent | [Controller](crates/astralog-controller/src) |
+| Producer and reader SDK | Rust client, metadata caching, partition routing, batching, idempotent retry handling | [Client](crates/astralog-client/src) |
+| Consumer groups | Durable group/offset state, cooperative rebalance and epoch fences | [Groups](crates/astralog-groups/src) |
+| Wire protocol | Versioned length-prefixed binary TCP; explicit request/response codecs | [Protocol](crates/astralog-protocol/src) |
+| Compression | **LZ4**, **Zstandard** and uncompressed records | [Storage codecs](crates/astralog-storage/src) |
+| Control Center UI | **React**, TypeScript, Vite, Tailwind CSS, React Flow, Recharts | [Web app](dashboard/web), [Rust Axum adapter](crates/astralog-dashboard/src) |
+| Engineering telemetry | Loopback **Prometheus** metric export, Docker Compose, **Grafana** dashboards | [Observability](observability), [guide](docs/MONITORING_MVP.md) |
+| Validation | Cargo unit/integration tests, deterministic model tests, Rustfmt, Clippy, GitHub Actions, source-pinned benchmark harness | [CI](.github/workflows/ci.yml), [benchmarks](crates/astralog-benchmark/src) |
+
+The core broker does **not** depend on Kafka, an external SQL database, Kubernetes, or a hosted messaging service. Grafana/Prometheus are an **optional local monitoring stack**, not the event storage engine.
+
+## Run it on your laptop
+
+### Prerequisites
+
+- **Windows** for the provided `.cmd` launchers and PowerShell benchmarking scripts; **Git**, **Rust / Cargo** with `rustup` (toolchain pinned in the repository), **Node.js + npm**.
+- **Docker Desktop** is optional, for Prometheus and Grafana only.
+- Internet access for first-time Cargo/npm dependency installation. Later `--offline` benchmark runs require locally cached Rust crates.
+- Free local ports for the demo: **7001–7003** (broker TCP), **7101–7103** (Raft peer TCP), **8787** (Axum adapter), and **5173** (web UI).
+
+#### Step 1 — clone the code
+
+```powershell
+git clone https://github.com/Thiyaga1586/AstraLog.git
+cd AstraLog
+rustup show
+```
+
+#### Step 2 — run three real brokers and the visual Control Center
+
+In **Windows Command Prompt (CMD)**, from the project root:
 
 ```bat
 scripts\run-control-center.cmd
 ```
 
-Alternatively, start each service manually:
+This opens three CMD windows: (1) the disposable RF3 broker demo with real test Produce/Fetch traffic, (2) a loopback-only read-only Rust/Axum metadata adapter, and (3) the React development server. The first build may be slow because Cargo and npm install dependencies. **This particular quickstart is a static-topology demo**; the separately implemented controller Raft quorum is exercised in dynamic-cluster integration tests, not started by this launcher.
+
+**Open the Control Center:** http://127.0.0.1:5173
+
+The UI offers an interactive broker topology and partition explorer. **Live** is based on real Metadata V0 returned by AstraLog. **Preview** is visibly labeled illustrative data; historical benchmark charts are never presented as current live throughput.
+
+You can also run the three components manually using the exact commands in the [Control Center guide](docs/CONTROL_CENTER.md). Close the three CMD windows (or press Ctrl+C in each) to stop the disposable demo.
+
+#### Step 3 — optional live Prometheus and authenticated Grafana
+
+With Docker Desktop running **and the brokers already started**, run this in another CMD window from the repository root:
 
 ```bat
-rem Window 1: Real AstraLog RF3 brokers with opt-in test traffic
-cargo run -p astralog-broker --example control_center_demo -- --traffic
-
-rem Window 2: Read-only HTTP adapter
-cargo run -p astralog-dashboard -- --bootstrap 127.0.0.1:7001 --bind 127.0.0.1:8787 --poll-timeout-ms 5000
-
-rem Window 3: React dashboard
-cd dashboard\web
-npm ci
-npm run dev
-```
-
-Open `http://127.0.0.1:5173`. See the [complete Control Center guide](docs/CONTROL_CENTER.md) for architecture, limitations and exact setup instructions. This is a local portfolio interface, not a qualified P11 security or observability release.
-
-## Live Prometheus and Grafana monitoring MVP
-
-The broker now supports an optional **loopback-only** Prometheus scrape endpoint.
-The disposable RF3 demo exposes `/metrics` on ports 9201, 9202 and 9203.
-It exports actual acknowledged Produce record and value-byte counts, returned
-Fetch volumes, completed Produce/Fetch request success and error counts, and
-server-handling latency histogram buckets. No metric is populated from preview
-data or the historical interview benchmark.
-
-```mermaid
-flowchart LR
-    Client[Real test Produce / Fetch] --> B[Three AstraLog brokers]
-    B -->|Per broker /metrics| P[Prometheus]
-    P -->|PromQL rates and histogram_quantile| G[Grafana]
-    UI[AstraLog Control Center] -->|Read-only Metadata V0| B
-```
-
-On Windows CMD, start Docker Desktop and the instrumented demo first.
-Then launch the monitoring services:
-
-```bat
-scripts\run-control-center.cmd
 scripts\run-monitoring.cmd
 ```
 
-Prometheus targets: `http://127.0.0.1:9090/targets`.
-Grafana: `http://127.0.0.1:3000`, dashboard `AstraLog Engineering MVP`.
-Grafana requires login as `admin`; `scripts\run-monitoring.cmd` generates
-a strong private password in the Git-ignored file
-`observability\secrets\grafana_admin_password.txt`. Use Windows CMD
-`type observability\secrets\grafana_admin_password.txt` to view it locally.
-Anonymous access and public signup are disabled.
-See [the exact monitoring contract and validation steps](docs/MONITORING_MVP.md).
-Acknowledged Produce records/sec includes successful duplicate retry responses
-and is **not** a claim of uniquely committed record throughput. Dashboard
-latency is computed from live histogram samples, never copied from benchmarks.
-This local demonstration does not qualify the complete P11 observability phase.
+| Service | Local address | Purpose |
+| --- | --- | --- |
+| Prometheus | http://127.0.0.1:9090/targets | Scrapes real broker `/metrics` endpoints |
+| Grafana | http://127.0.0.1:3000 | Shows requests/s, acknowledged records/s, errors/s, and measured p50/p95/p99 server-side latency |
+| Broker metrics | http://127.0.0.1:9201/metrics (also 9202/9203) | Each broker's counters and histograms |
 
-AstraLog is a from-first-principles **Rust distributed event log** inspired by useful ideas from Kafka, Apache Pulsar/BookKeeper, and Raft — without using Kafka, Pulsar, BookKeeper, ZooKeeper, etcd, RabbitMQ, or another broker internally. A work-queue extension was planned but is **not implemented**.
+Grafana **requires login** (username: `admin`). The launcher generates a strong, Git-ignored password, stored **only on your computer** at `observability\secrets\grafana_admin_password.txt`. To read it locally in CMD:
 
-The project is intentionally built to expose the hard systems problems rather than hiding them:
+```bat
+type observability\secrets\grafana_admin_password.txt
+```
 
-- append-only segmented storage
-- durable WAL semantics and crash recovery
-- CRC corruption detection
-- partitioning and ordered logs
-- Multi-Raft replication and leader election
-- quorum acknowledgements
-- cluster metadata consensus
-- replica catch-up and reconfiguration
-- consumer offsets and cooperative consumer groups
-- idempotent producers and duplicate detection
-- retries, visibility leases, and dead-letter queues (**planned P10, not implemented**)
-- batching and compression
-- retention and log compaction
-- backpressure and quotas
-- partition rebalancing
-- graceful draining and rolling upgrades (**planned P11**)
-- observability, security, and chaos testing (**planned P11–P12**), plus reproducible benchmarks
+Anonymous access and self-signup are disabled. Grafana, Prometheus, and broker metrics bind to **127.0.0.1**, not the public internet. Do not publish these ports. See [monitoring details and metric semantics](docs/MONITORING_MVP.md); acknowledged responses per second are not identical to unique committed append throughput.
 
-## Interview-ready demo (2026-11-03)
+### Validate the project
 
-**Portfolio milestone: DEMONSTRABLE — not production qualified.**
-The checked-in [interview demo and benchmark guide](docs/INTERVIEW_READY.md)
-starts real RF1 and RF3 brokers on local TCP, creates topics, produces data,
-fetches committed records, and reports measured throughput and p50/p95/p99
-latency. A historical private-lineage release benchmark source (`d7e32d3`) completed
-**12 workload measurements with zero producer errors**; three focused
-restart/failover/deduplication checks also passed.
-
-**Public-history provenance:** This repository uses a sanitized, shortened
-history. Older commit identifiers cited in this README and in qualification
-reports, including `d7e32d3`, belong to the earlier private development
-lineage and are **not reachable in this repository**. The checked-in benchmark
-CSVs and logs are historical evidence, not an exact-commit reproduction on the
-sanitized public history. Rerun the release benchmark from a reachable, tagged
-commit before presenting new results as publicly reproducible at that commit.
+Run from the repository root:
 
 ```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked -- --test-threads=1
+```
+
+For the frontend, run from `dashboard/web`:
+
+```powershell
+npm ci
+npm run build
+npm test
+```
+
+The same core checks run in [GitHub Actions](.github/workflows/ci.yml), including focused RF3 failover/regression gates and the full Rust workspace test suite. A green CI run is evidence for **that exact commit**, not a universal production-qualification certificate.
+
+### Reproduce the producer/consumer benchmark
+
+Run from repository root in **Windows PowerShell**:
+
+```powershell
+# Quick debug-mode functional smoke test (NOT a publishable performance result)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interview-demo.ps1 -Fast
+
+# Full optimized local benchmark + targeted failure checks
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interview-demo.ps1
 ```
 
-On the measured laptop, RF3 quorum producer buffering improved throughput
-from **14.34 to 47.09 records/s** (1 KiB records, four producers, two
-repeats); see the [raw results and generated summary](docs/benchmarks/interview_20261103/SUMMARY.md).
-This is a small single-host benchmark, **not** a claim of production
-performance or full-system release qualification. The known intermittent P7
-full-suite regression remains disclosed in the guide.
+The launcher creates a timestamped directory under your Windows TEMP folder containing **raw CSV samples, environment metadata, console logs, and derived summaries**. The integration tests use real loopback broker TCP endpoints, storage directories, record reads, and controlled fault scenarios. This is a **single-machine** test setup, not a three-machine cluster.
 
-### Adversarial audit follow-up (2026-11-03)
+**Previously recorded example, not a new performance claim:** a historical RF3 quorum workload with 1 KiB records and four producers measured **10.71 records/s unbuffered versus 33.31 records/s buffered** in the post-audit comparison. These were short, two-repeat local measurements; hardware and raw results are in the [archived report](docs/benchmarks/remediation_20261103/SUMMARY.md).
 
-See [what was hardened and why](docs/REMEDIATION_NOTES.md), written for an
-engineering interview. The benchmark now checks fetched **payload bytes,
-record identities and offsets**, and new runs retain individual latency
-samples for independent percentile verification. The original 2026-11-03
-release CSV remains a separate source-pinned historical measurement.
-The [13-item adversarial audit closure matrix](docs/AUDIT_CLOSURE_MATRIX.md)
-distinguishes tested fixes from remaining production-design limitations.
-The post-audit [clean-commit optimized benchmark](docs/benchmarks/remediation_20261103/SUMMARY.md)
-retains 2,464 request samples and an independently verified percentile report.
+**Benchmark provenance:** Historical CSVs and several old commit SHAs came from a prior private development lineage that is not reachable in this shortened public Git history. Do **not** describe those numbers as remeasured or exactly reproducible at the current public SHA. Rerun the benchmark at a reachable tagged commit and retain the new raw artifacts before making such a claim. See [demo methodology](docs/INTERVIEW_READY.md) and [benchmark harness](docs/P8_BENCHMARK_HARNESS_REPORT.md).
 
-**Security and deployment:** This is an unauthenticated local prototype.
-See [SECURITY.md](SECURITY.md); do not expose its broker/controller endpoints
-to untrusted networks. The listener configuration now refuses non-loopback
-addresses rather than accidentally exposing unauthenticated sockets.
-Windows clean-restart tests do not prove sudden
-power-loss durability. P9-G retained-history V2 exact-HEAD qualification
-remains separate from the interview milestone.
+## Explore the codebase
 
-**For any further public-history export:** Remove private paths from the
-*published history*, not just the latest files. The
-`scripts/prepare-public-snapshot.ps1` helper can generate a snapshot without
-old Git history. Inspect the export and rerun release benchmarks on its own
-reachable commit before claiming publicly verifiable performance figures.
+| If you want to learn… | Start here |
+| --- | --- |
+| How one Produce request becomes a replicated entry | [Broker server](crates/astralog-broker/src/server.rs) → [Broker state](crates/astralog-broker/src/state.rs) → [Replication runtime](crates/astralog-replication/src/runtime.rs) |
+| How election, commit, and persistence ordering work | [Raft engine](crates/astralog-raft/src/engine.rs) → [Persistence adapter](crates/astralog-replication/src/storage_adapter.rs) |
+| How files survive a restart | [Storage partition log](crates/astralog-storage/src/partition.rs) → [Formats and recovery](docs/FORMAT_V1.md) |
+| How topic placement and metadata fail over | [Controller runtime](crates/astralog-controller/src/runtime.rs) → [Placement](crates/astralog-controller/src/placement.rs) |
+| How retries avoid duplicates | [Client](crates/astralog-client/src/lib.rs) → [Producer state](crates/astralog-replication/src/producer_state.rs) |
+| How cooperative group ownership is fenced | [Groups](crates/astralog-groups/src) → [P6 design](docs/P6_GROUPS_V1.md) |
+| How to assess correctness and design trade-offs | [Master engineering guide](docs/ASTRALOG_MASTER_GUIDE.md) → [Architecture decisions](docs/ARCHITECTURE_REVIEW.md) → [Invariants](docs/INVARIANTS.md) |
 
-## Current status
+## Limitations and future work
 
-**P9 — Retention and Log Compaction: P9-F EXACT-HEAD PASS; P9-G LOCAL CLOSURE CANDIDATE COMMITTED, EXACT-HEAD QUALIFICATION PENDING**
+The engineering roadmap is intentionally separate from what has already been demonstrated.
 
-P0, P1, P2, and P3 are closed. `RAFT_V1.md` is frozen and the independent
-`astralog-raft` core now implements the complete P3 consensus scope: pre-vote,
-RequestVote, leader election/initialization, AppendEntries replication and
-conflict repair, durable commit/apply ordering, check-quorum, learners, joint
-membership, snapshots/install-snapshot, leadership transfer, bounded
-uncommitted application data, deterministic simulation, and a mechanically
-checked bounded formal safety model. P4 has now frozen
-`P4_REPLICATION_V1.md` and implemented the full P4 integration scope: real
-P1-backed Raft persistence, bounded broker-pair Raft transport, RF 1/3/5
-partition runtimes, `acks=0/leader/quorum`, committed Fetch/ListOffsets,
-leader-term fencing, conflict repair, restart recovery, and crash-safe
-P3-authorized rebootstrap. P4 is mechanically closed. P5-A now freezes the
-controller/placement ownership boundary and the base-level production checklist.
-P5-B adds the pure deterministic astralog-controller metadata state machine and
-frozen ControllerCommandV1 codec. P5-C now adds crash-durable controller hard
-state/log/commit persistence, canonical ControllerSnapshotV1 storage, P3
-RecoveredState reconstruction, commit/snapshot crash intents, follower
-InstallSnapshot rebootstrap, and snapshot-floor log compaction. P5-D now adds a
-separate bounded CRC-protected controller Raft transport, strict cluster/source
-identity fencing, persistent peer reconnect/backoff, the P3-backed controller
-runtime, leader-only mutations with commit+apply response ordering, and a real
-three-controller election/failover/rejoin qualification. P5-E now adds the
-create-once CRC-protected controller bootstrap manifest containing cluster ID +
-complete static voter set, atomic no-overwrite publication, runtime
-persist-before-serve enforcement, and foreign-cluster/voter-set refusal. P5-F
-now adds the typed broker registration/rejoin/lifecycle surface, deterministic
-pre-proposal semantic validation, globally unique broker ID/node UUID identity,
-strictly monotonic committed incarnations, leader-only stale-incarnation/UUID
-authority fencing, and durable JOINING/ACTIVE/DRAINING/FENCED/REMOVED lifecycle
-semantics across controller failover/restart. Heartbeats and failure detection
-are now qualified in P5-G as leader-local volatile state: every heartbeat passes
-the committed BrokerAuthority gate, progress arrays are bounded/canonical,
-failure-detector time is explicitly injected and monotonic, suspicion is reset on
-controller leadership change, and Healthy/Suspect/Unavailable observations never
-mutate replicated broker authority. P5-H now routes topic create/expand/delete
-through controller authority, generates TopicId before proposal, enforces Wire V1
-partition/RF bounds, and implements the frozen deterministic placement order over
-P5-G liveness plus durable broker lifecycle/feature/rack/zone metadata. Required
-failure domains never silently degrade; Preferred fallback is explicit. Dynamic
-broker metadata dissemination is now qualified in P5-I: controller application
-entries are retained as bounded committed deltas, heartbeat lag selects bounded
-contiguous deltas or snapshot fallback, and the broker metadata cache applies
-updates atomically with monotonic epoch, gap, stale-update, and cluster fencing.
-P5-J now makes that cache authoritative for production broker topology: committed
-assignments create/remove local P4 actors, controller broker records rebuild peer
-endpoint/incarnation expectations, and public Metadata is built from controller
-authority while leader/term still come only from observed P3 state. DescribeCluster
-and ReassignPartitions V0 are live only in dynamic-controller mode; reassignment
-commits durable movement intent. P5-K/L now executes that intent through destination
-learner creation, ordinary P4/P3 catch-up, incarnation/generation-fenced progress,
-P3 joint-consensus promotion, stable target-voter observation, optional P3 leadership
-transfer, safe source removal and atomic final assignment/`Complete` publication. The
-workflow resumes after controller/source/destination failures from committed intent plus
-observed P3 state; removed replica bytes remain preserved as non-authoritative orphaned
-state. P5-N now qualifies the durable active cluster feature level: brokers and every static
-controller voter advertise checked support ranges, unsupported bumps fail before activation,
-the frozen `SetFeatureLevel` command is explicit/commit-before-return/strictly monotonic, and
-`FeatureGate` lets later irreversible behavior fail closed until the broker/controller has
-applied the required committed level. A controller that cannot support the recovered active
-level refuses to serve after restart. Static P4 topology remains only for compatibility tests.
-P5-O now qualifies the frozen durable producer-ID allocator end to end: controller Raft and
-snapshot state own one monotonic `next_unallocated_producer_id`, allocations are contiguous
-and hard-bounded to one million IDs per command, successful ranges return only after
-commit+apply, lost responses may waste but can never reuse committed IDs, restart/failover
-preserve the next ID, and overflow fails atomically. No producer epoch, sequence, session or
-deduplication behavior is pulled forward from P7. Qualification also repaired a latent
-P5-K/L post-source-removal liveness gate without weakening its safety boundary: stable P3
-target exclusion is still required before source removal, while the later removal-complete
-stage is exact-stage-fenced controller bookkeeping. A separate post-P5-O boundary repair now
-closes two P3 defects exposed by repeated movement/leadership-transfer stress: a committed
-learner promotion now changes the live local role from learner to follower, and follower
-AppendEntries never regresses an already-durable commit index when a newly elected leader is
-temporarily behind in its `leader_commit` knowledge. Movement reconciliation also requires
-local P3 leadership only for operations that actually propose EnterJoint/LeaveJoint; already
-durably observed membership states may advance exact-stage-fenced controller bookkeeping.
-P5-M now qualifies the general explicit preferred-leader hook independently of placement:
-the target must be an ACTIVE committed assignment voter, P3 membership must be stable and
-match controller authority, and the current P3 leader must observe the target caught up through
-its durable tail before invoking the already-frozen P3 leadership-transfer primitive. Success
-is reported only after P3 subsequently names that target as leader; no controller metadata field
-decrees partition leadership, and the periodic broker control loop contains no autonomous
-leader-balancing policy. Continuous balancing remains P11.
-P5-P now qualifies the frozen controller/broker failure matrix: deterministic seeded controller
-and placement campaigns, real quorum minority/leader/incarnation crash boundaries, stale authority
-fencing, controller-outage data-plane isolation, sustained RF3 writes through reassignment,
-source/destination/controller movement failures, stage-by-stage controller-leader death,
-snapshot/metadata/feature/producer-ID recovery, movement model checking, and bounded-resource /
-control-scheduling audits. Failure qualification also closes two resilience gaps without changing
-wire/disk/consensus formats: controller live-state growth is admitted only while worst-case
-Snapshot V1 remains inside the existing 64 MiB transport envelope, and rejected incremental broker
-metadata history falls back to an authoritative controller snapshot.
-P5-Q closes the phase-level compatibility and scope audit: P1 storage is tree-identical to P4
-closure, all 11 frozen P2 goldens remain unchanged, the separately qualified P3 compatibility
-repair remains 122/122 green, frozen P4 RF3 semantics remain green, and the complete workspace
-closes at 380/380. P6-A now freezes the consumer-group/offset-coordination contract and the
-176-action execution checklist before any P6 runtime implementation.
-P6-B now implements only the frozen representation layer: checked group/member/epoch identities,
-bounded canonical Wire V0 bodies for reserved API keys 30..35, and a lower-level
-`astralog-groups` crate for exact little-endian Group/Offset durable record and logical-key codecs.
-Six new public P6 request goldens plus exact fixtures for all four internal record kinds freeze the
-bytes. P6-C now adds only the frozen internal-topic/routing foundation: P5 authority creates or
-validates exactly `__astralog_groups` and `__astralog_offsets` at 64 partitions / RF3 /
-Preferred, public topic lifecycle paths remain unable to mutate the reserved names, and GroupId
-routing reuses the frozen P2 hash. Coordinator authority is observed from the current P3 leader/term
-of the groups shard; controller metadata supplies placement and broker addresses but never decrees
-partition leadership. The RF3 qualification performs real leadership transfer, stale-term fencing,
-leader failure/rerouting and broker restart without recreating either TopicId. API keys 30..35 remain
-unadvertised. P6-D now adds the pure deterministic durable group-state layer in `astralog-groups`:
-exact state-version sequencing/replay fencing, first-epoch preparation, dynamic/static member
-admission, unique InstanceId enforcement, subscription/leave transitions, stale group/member epoch
-rejection, strict live-state bounds, phase semantics and byte-deterministic command results. Target
-assignments are accepted only as already-computed canonical input. P6-E now supplies that pure
-deterministic uniform-sticky assignor: exact bounded flow oracles minimize maximum member load, then
-movement from still-eligible owners, then the canonical MemberId owner vector; identical subscriber
-sets additionally satisfy the frozen load-spread <=1 rule. Exhaustive bounded enumeration matches the
-production solver. P6-F now adds the pure cooperative ownership workflow above that target assignment:
-PREPARING state derives an exact pending-epoch OffsetGroupFence, epoch activation is withheld until
-that fence is observed committed, moved old owners remain active in REVOKING until exact-authority
-release, and target owners remain inactive until a matching released-state OffsetOwnerFence is observed
-committed. Exact duplicate fences/RevokeAcks are idempotent, strictly newer prepared epochs may
-supersede in-flight work without granting active ownership, committed-history recovery resumes every
-prepare/release/fence crash boundary, and a bounded state-space model directly qualifies I-18/I-19.
-P6-G now adds the leader-local session/liveness layer without creating a second authority plane: session
-timeouts are frozen to 6s..300s, heartbeat cadence uses the deterministic timeout/3 clamp, accepted
-heartbeats require exact committed GroupId/GroupEpoch/MemberId/MemberEpoch and refresh only volatile
-deadlines, and coordinator leadership change discards those observations and grants every committed
-member one fresh full timeout. Expiry itself is only a candidate; the existing durable Leave transition
-must commit before membership authority changes. Static replacement is qualified through MemberEpoch+1
-plus the normal higher-GroupEpoch path: identical subscriptions preserve every valid assignment while
-changed eligibility uses the ordinary P6-E/P6-F rebalance. P6-H now binds those canonical group transitions to
-the committed RF3 `__astralog_groups` log: the current P3 shard leader/term is the only coordinator authority,
-mutations use P4 quorum commit and are replay-verified before success, and restart/failover reconstructs state from
-committed history only. PREPARING, released handoffs, join/revoke/leave leader failures, lost successful responses,
-controller-quorum outage isolation and finite count+byte coordinator admission are qualified end to end. A restart
-stress failure also closed a P4 recovery ordering gap by explicitly re-fsyncing a validated surviving uncommitted
-tail before presenting it to Raft as stable history; P1 format/semantics remain unchanged. P6-H closes at **444/444**
-workspace tests. P6-I now binds the frozen offset/fence records to the real RF3 `__astralog_offsets` log: a bounded
-logical state machine folds committed group/owner fences and latest offset values, CommitOffsets validates exact
-committed group/member/active-assignment authority plus durable effective-owner fencing atomically before one quorum
-proposal, and success is replay-verified with the real Raft commit index. FetchOffsets reads committed history only;
-metadata and broker-generated commit timestamps survive offsets-leader death, continued writes, replica restart and
-leadership transfer back. RF3 qualification also proves the old-group cross-topic race is rejected after group-fence
-commit, late old-owner writes are rejected after owner-fence commit, authorized rewind remains legal, and equivalent
-lost-response retries cannot revive stale authority. No P9 physical compaction exists. P6-I closes with workspace
-formatting, Clippy `-D warnings`, the real P6 RF3 suite **4/4**, and the complete workspace **453/453 PASS**. P6-J now
-activates public API keys 30..35 only behind the committed feature-level/internal-topic readiness gate and routes every
-public operation through exact current group-coordinator authority. CommitOffsets/FetchOffsets never make the client
-race two coordinators: the group leader supplies committed group authority and uses a bounded private broker-to-broker
-hop to the independent offsets-shard leader, where the already-qualified P6-I worker executes. The Rust client keeps
-bounded non-regressing coordinator/member authority caches, bounded retries/in-flight group work, explicit mutation
-ambiguity, and a cooperative revoke helper that can commit revoked-partition offsets before RevokeAck while unaffected
-assignments continue. Direct wire qualification proves pre-activation `UNSUPPORTED_API_KEY` and activated wrong-broker
-`NOT_LEADER` with an exact coordinator hint and no mutation. Real RF3 E2E covers join, heartbeat, remote-offset
-commit/fetch, two-member revoke/handoff, committed offset transfer, Leave and higher-epoch reassignment. P6-J closes
-with P6 RF3 **5/5**, workspace Clippy `-D warnings`, formatting/diff hygiene, and **459/459 PASS** in the complete
-serialized workspace qualification. P6-K now binds the frozen session semantics to bounded production maintenance:
-new group-shard leaders reconstruct committed membership and grant one fresh full session grace per P3 term, silent
-members are removed only through the durable Leave/fence path, and committed P5 partition-count changes enter the
-ordinary higher-GroupEpoch cooperative rebalance instead of rewriting ownership directly. Real RF3 qualification runs
-join and Leave under committed offset traffic, crash-without-Leave and slow-heartbeat cases, coordinator death in
-STABLE/PREPARING/REVOKING, offsets-leader death before both group-fence and owner-fence commit, static replacement races
-and live topic expansion. Deterministic qualification adds 32 seeded membership-churn campaigns, the existing exhaustive
-assignor/cooperative models, all **120** offset-fence event permutations, corruption/gap replay failure, resource one-over
-limits and scheduling-pressure checks. P6-K closes with P6 RF3 **9/9**, `astralog-groups` **55/55**, workspace Clippy,
-format/diff hygiene and **467/467 PASS** in the complete serialized workspace qualification. P6-L closes the phase by
-proving the frozen P1 format/index and original P2 golden sources are unchanged, P6 introduces no Raft source delta
-relative to the P5 closure, P4/P5 compatibility suites remain green, and no P7/P8/P9/P10/P11/P12 behavior is pulled
-forward. The final pre-commit closure gate is again **467/467 PASS** with P6 RF3 **9/9** and `astralog-groups` **55/55**.
-The authoritative closure commit is requalified after commit and receives a Git note containing the exact-HEAD PASS
-evidence before P6 is considered closed. P7-A now freezes the producer-idempotency architecture before code: controller
-Raft issues ProducerId/ProducerEpoch authority, each data partition owns accepted epoch plus per-partition sequence/dedupe
-state, idempotent Produce V1 is quorum-only, exact committed retries return original offsets, and higher-epoch fencing is
-deliberately partition-local after committed authority. Storage V1 already contains the required producer fields, so P7
-does not redesign P1 bytes. `P7_CHECKLIST.md` defines P7-001…P7-155; only P7-001…014 belong to the architecture freeze.
-P7-B now freezes the executable representation boundary without activating producer runtime semantics: checked
-ProducerId/ProducerEpoch/ProducerSequence/ProducerAuthority values, InitProducer V0 and Produce V1 codecs, protocol-owned
-API-version metadata, dependency-free FIPS-qualified SHA-256 canonical batch identity, ApplicationCommand V2,
-ControllerCommand V2 producer-session records and a ControllerSnapshot V2 envelope around exact V1 snapshot bytes plus a
-sorted producer-session table. Legacy Produce V0/P2 bytes remain exact; broker P7 dispatch/readiness remains disabled.
-P7-B closes with workspace Clippy `-D warnings`, P6 RF3 **9/9** and a complete serialized workspace **485/485 PASS**.
-P7-C now activates the authoritative controller producer-session plane without pulling partition dedupe forward: a
-canonical ProducerId -> ProducerEpoch table shares the exact P5 durable allocator, new sessions and CAS epoch bumps are
-feature-level-3 gated and atomic, mixed ControllerCommand V1/V2 log replay is version-dispatched, and V1/V2 controller
-snapshot migration/restart is qualified. Internal InitProducer waits for P3 quorum commit/application before success;
-lost new-session/bump responses, controller leader failure and old-leader restart preserve non-reuse/non-regression.
-P7-C closes with controller **104/104**, P6 RF3 **9/9**, workspace Clippy `-D warnings`, doc tests and a complete serialized
-workspace **493/493 PASS**. Public broker InitProducer/Produce V1 and partition sequence/dedupe logic remain disabled.
-P7-D now adds the pure, still-unwired `PartitionProducerStateV1`: admission is side-effect free, only committed application
-advances accepted epoch/sequence, exact retained retries return their original committed offsets, gaps/partial overlaps and
-changed/too-old retries fail explicitly, lower epochs are fenced and the recent retry window is hard-bounded to five batches.
-An exhaustive small-state oracle checks I-15/I-16/I-17 across epoch/sequence/digest combinations. Storage/P4 integration is
-still disabled. P7-D closes with replication **56/56**, P6 RF3 **9/9**, workspace Clippy `-D warnings`, doc tests and a
-complete serialized workspace **500/500 PASS**.
-P7-E activates the producer metadata already reserved in Storage V1 without introducing a new disk format. P4 now
-version-dispatches ApplicationCommand V1/V2: legacy V1 remains producer-less, while V2 persists ProducerId/Epoch/base
-sequence into the existing idempotent frame header. Committed-only producer reconstruction ignores uncommitted tails,
-survives conflict truncation, restart and P4 rebootstrap, and exposes a bounded P9 handoff surface containing accepted epoch,
-next sequence and the newest five retry records. Storage validates producer identity/sequence fields and the unchanged frame
-CRC covers them; frozen idempotent/non-idempotent Storage V1 fixtures remain exact. P7-E closes with Storage **44/44**,
-Replication **62/62**, P6 RF3 **9/9**, workspace Clippy `-D warnings`, doc tests and a complete serialized workspace
-**507/507 PASS**. P7-F now binds that committed recovery surface to bounded runtime admission without exposing the public
-wire path: unseen/higher producer authority is confirmed by the controller at the broker layer, equal accepted epochs stay
-on the data-partition path and continue during controller outage, lower epochs are locally fenced, exact pending retries
-coalesce onto one proposal, exact committed retries return original offsets without another append, and committed producer
-state advances only after durable quorum commit. The runtime cache is capped at **4,096** reconstructable entries and pending
-idempotent work remains under the existing finite proposal count/byte limits. A real three-controller/RF1 broker scenario
-qualifies controller confirmation, epoch bump/fencing and complete controller outage continuation while InitProducer/Produce
-V1 remain undispatched. P7-F closes with replication **66/66**, P6 RF3 **9/9**, P7 runtime **1/1**, workspace Clippy/format
-hygiene and a complete serialized all-target workspace **512/512 PASS**. P7-G now adds the derived
-`producer.snapshot` acceleration layer without changing P1 bytes: canonical per-partition snapshot state is CRC-protected,
-hard-bounded to **64 MiB**, crash-safely published, validated against committed Raft authority and replayed with committed
-suffix frames in bounded pages. Missing/corrupt/wrong-identity/ahead snapshots rebuild from committed P1 history, and cache
-eviction followed by snapshot-aware reconstruction returns the same exact retry offsets/Raft index. P7-G closes with
-Replication **73/73**, Storage **44/44**, P6 RF3 **9/9**, workspace Clippy/doc tests and a complete serialized workspace
-**519/519 PASS**. P7-H now activates readiness-gated public InitProducer V0 and Produce V1 without changing legacy
-Produce V0. The Rust client owns bounded ProducerId/Epoch and per-partition sequence/pending state, permits one unresolved
-range per producer-partition, retains the exact encoded Produce V1 body across bounded retries, advances sequence only after
-authoritative success, resets partition sequence state after a committed epoch bump, and clears local authority after an
-ambiguous InitProducer so recovery creates a fresh session. The public RF1 qualification deliberately loses a committed
-InitProducer response and a Produce V1 response, proves byte-identical retry, observes exactly one read-committed logical
-record/original offsets, then restarts the producer at the exact next epoch with sequence zero. P7-H closes with P7 runtime
-**2/2**, broker **22/22**, client **11/11**, P6 RF3 **9/9**, workspace Clippy/format/diff/doc tests **PASS**, and a complete
-serialized all-target workspace **524/524 PASS**. Real RF3 producer lost-response/fencing/failover remains P7-I.
-P7-I now qualifies that real RF3 boundary end to end: lost committed responses deduplicate, leader death after quorum returns
-the original result from a successor, leader death before persistence accepts the sequence once, and a leader-only durable
-uncommitted tail is repaired while retry commits one logical copy. Explicit leadership transfer preserves retry identity while
-the client refreshes only the routing term. Tentative higher ProducerEpoch state fences locally but is not inherited after
-failover; committed higher epoch resets sequence to zero and permanently fences the old epoch across leader loss. Accepted
-epochs continue through total controller outage, unseen/higher authority fails without proposal, concurrent epoch bumps have
-one CAS winner, ambiguous InitProducer survives controller failover without ProducerId reuse, and RF3 snapshot/restart
-reconstructs exact retained retry results. P7-I closes with focused RF3/controller **11/11**, P6 RF3 **9/9**, workspace
-Clippy/format/diff/doc tests **PASS**, and a complete serialized all-target workspace **535/535 PASS**. P7-J then closes
-P7-136..147 with deterministic state/failover models, resource/corruption bounds and scheduling stress; focused P7-J
-qualification plus the complete serialized workspace are **548/548 PASS**. Exact-HEAD requalification exposed a narrow
-successor-readiness boundary: idempotent Produce now waits with transient `BUSY` until the new leader has durably committed
-a current-term entry, making inherited prior-term history safe committed duplicate-suppression authority. The repaired tree
-requalifies P7 failover **12/12**, replication **82/82**, P6 RF3 **9/9**, P7 runtime **2/2**, Clippy/format/diff/doc tests and
-the full workspace **548/548 PASS**. The bounded repair is committed at `3373976`, independently repeats the same focused
-and complete **548/548** gates on its exact clean HEAD, and carries a qualification Git note. P7-K compatibility auditing
-then requalifies frozen P1 Storage V1, original P2 wire goldens, P3/P4 replication semantics and P5/P6 controller/group
-semantics while confirming no P8-P12 implementation was pulled forward. P7-K's final closure tree passes focused models,
-real RF3 failure qualification, frozen compatibility suites, fmt/Clippy/doc/diff hygiene and the complete serialized
-workspace **548/548**. The sole P7 closure commit is `d0d0e85`, its exact SHA carries the required
-qualification Git note, and P7 is authoritatively closed. Two post-P7 **test-harness-only** hardenings culminate at
-`1384279`: the earlier `6f17a29` repair removes an invalid offsets-coordinator readiness dependency from the P6
-silent-member failover fixture, and `1384279` gives the second client in the long public-integration fixture a
-bounded 20-second setup deadline. Exact `1384279` passes P6 **9/9**, the complete workspace **548/548**,
-fmt/Clippy/doc/diff gates, and carries a qualification Git note without changing production semantics. P8-A then
-froze the batching/compression/flow-control/performance contract and execution ledger. P8-B now implements only
-controller-owned topic performance metadata and feature activation: checked None/LZ4/Zstd policy metadata,
-atomic ControllerCommand V3 CreateTopic-with-performance, ControllerSnapshot V3, deterministic V1/V2 defaults,
-committed feature level 4 / feature key 14 activation, and additive CreateTopic/DescribeTopic V1. Frozen V0/V1
-Produce/Fetch behavior and prior controller bytes remain unchanged; AlterTopicConfig remains unavailable.
-P8-B qualification passes focused controller **6/6**, protocol **1/1**, public dynamic-broker P8 **1/1**,
-original P2/P6/P7 goldens **11/11 + 6/6 + 4/4**, fmt/Clippy/doc/diff gates and the complete serialized all-target
-workspace **557/557**. P8-C now activates the reserved Storage V1 LZ4/Zstd identifiers with exact pinned codec
-profiles, no-gain fallback, bounded preallocation/decode, immutable compressed goldens, mixed-codec restart/index
-rebuild/truncation, compressed rebootstrap and P7 producer-state equivalence. Committed P8-B topic policy is mapped
-into the replication persistence codec only after feature-level-4 readiness; default historical behavior remains None.
-Focused storage **53/53** and replication **84/84** are green, the real dynamic-broker P8 case proves a Zstd topic
-physically stores Zstd data, P6 is **9/9**, P7 failover is **12/12**, P7 runtime is **2/2**, and the deterministic
-bounded P8-C gate covers **568/568** tests with fmt/Clippy/doc/diff gates PASS. P8-D now adds the opt-in bounded
-per-topic-partition client accumulator over the frozen Produce V0/V1 formats: exact record/byte/linger closure,
-unchanged keyed/sticky partitioning, explicit flush, metadata-invalidation closure, shutdown drain, byte/record/partition
-caps, and P7 one-unresolved-range compatibility. Buffered V1 records consume sequence authority only when a closed batch
-reaches the existing P7 send boundary, and the pending encoded V1 body remains the retry authority. The real P8 broker/
-client campaign proves buffered V0 offsets 0..1, buffered V1 offsets 2..3, explicit flush at offset 4, shutdown drain at
-offset 5, exact six-record fetch order, and continued committed Zstd persistence. P8-D qualification is **578/578 PASS**
-by bounded target decomposition with workspace Clippy/doc/format/diff and frozen Storage/P2/P6/P7 golden checks PASS.
-P8-057..073 are closed and `b421f2d` carries its exact-HEAD PASS note. The P8-E design audit exposed the historical
-single-token persistence-frontier conflict, and ADR-018 resolved it through the exact-HEAD-qualified V2 re-freeze
-`370ae92`. P8-E now implements that frozen design: a bounded ordered append-token queue with a separate staged logical
-frontier, one authoritative durable frontier, bounded count/bytes/group delay, FIFO completion after proven sync,
-hard barriers for hard-state/commit/truncate/snapshot/rebootstrap work, and deterministic logical-token versus
-physical-sync counters. Grouped execution is byte/logically equivalent to sequential persistence, leader/quorum ack
-semantics are unchanged, crash-before-sync and post-sync/pre-completion ambiguity are qualified, and mixed
-None/LZ4/Zstd history preserves order/offsets. Pre-commit qualification is **596/596 PASS** by bounded decomposition
-with workspace Clippy/doc/format/diff and frozen Cargo/Storage/P2/P6/P7 golden checks PASS. The first closure commit
-`ff4d0b4` was not granted exact-HEAD authority because the P6 churn suite exposed a JoinSubscribe post-commit
-ambiguity boundary. The bounded compatibility repair is authoritative at `e929191`: its exact SHA passes the complete
-**596/596** P8-E gate plus mechanical/frozen-byte checks and carries the P8-E PASS note. P8-F is now authoritative at
-`039c700`: finite per-follower message/byte windows, bounded Raft catch-up effect construction, term/incarnation/
-connection/snapshot fencing, reserved Raft-control capacity, slow-follower/restart qualification, committed-only bounded
-Fetch scanning, burst-coalesced long polling and move-based response assembly preserve unchanged Fetch V0 bytes. Its
-exact SHA carries the P8-F PASS note after **604/604** exact-HEAD qualification. P8-G implements P8-108..126 only:
-finite global broker data count/byte admission, strict low/high watermark hysteresis, control-plane reserve, broker-local
-anonymous/topic token buckets, pre-mutation `BROKER_BUSY` + nonzero response `throttle_ms`, bounded no-response `acks=0`
-overload semantics and client throttle honoring. Real broker pressure and RF3 simulation qualify slow-consumer,
-producer/follower/consumer pressure and control progress. P8-G is authoritative at `98bf895`: its exact SHA carries the
-PASS note after focused **14/14** and complete **618/618** exact-HEAD qualification plus mechanical/frozen checks. P8-H
-now implements P8-127..143 as repository-owned benchmark tooling: a release-only clean-SHA runner, canonical manifest and
-raw bundle, deterministic frozen-factor coverage matrix and seeded workloads, separated warmup/measurement, hard-bounded
-raw latency retention, system-metric snapshots, deterministic raw-derived Markdown reporting, repeated-run comparison
-gating and a short offline workspace smoke test. The optimized benchmark binary builds and focused tooling is **19/19
-PASS**; the complete pre-commit workspace gate is **637/637 PASS**. P8-I then closed compatibility and retained the real
-engineering baseline. Final P8 closure is authoritative at `37c07a5`: its exact SHA carries the P8 PASS note after focused
-**87/87** and complete serialized **638/638** qualification plus release-build, Clippy, doc, fmt, diff and frozen-source
-checks. P9-A is authoritative at `b7c8552`: its exact SHA carries the P9-A PASS note after the same complete **638/638**
-serialized compatibility gate and freezes the retention/compaction contract plus sparse retained-history Storage V2
-architecture. P9-B is authoritative at `f583b6b`: its exact SHA carries the P9-B PASS note after focused **14/14** and
-complete serialized **653/653** qualification. It owns checked controller retention metadata, command/snapshot V4, feature
-key 15 / committed cluster feature level 5 activation, CreateTopic/DescribeTopic V2 and AlterTopicConfig V0 readiness gating.
-P9-C is authoritative at `dc39dd7`: its exact SHA carries the P9-C PASS note after focused **14/14** and complete serialized
-**667/667** qualification. P9-D is authoritative at `fe64a0a`: its exact SHA carries the P9-D PASS note after focused **10/10**,
-combined P9 **38/38** and complete serialized **677/677** qualification. P9-E is authoritative at `9da9aac`: its exact SHA
-carries the P9-E PASS note after focused **8/8**, combined P9 **45/45**, and complete serialized **684/684** qualification.
-P9-E freezes deterministic bounded COW keyed compaction, sparse original-offset history, snapshot/policy/manifest publication
-fences and generation-owned readers, while retaining producer-bearing sources until a committed P9-F checkpoint exists.
-P9-F implements only P9-112..129 as the **current bounded checkpoint**: canonical bounded producer-state
-maintenance commands, quorum-committed checkpoint before source reclamation, persisted-snapshot-floor gating, retained
-checkpoint plus committed suffix P7 reconstruction, exact retry/epoch/sequence preservation after compacted-source removal,
-derived-sidecar deletion and restart, 4,096-producer bound, and RF3 checkpoint failover. The RF3 exact-retry regression
-passed six consecutive recovered-tree runs. Its authoritative exact-HEAD parent is
-`cd064a4` and carries the `P9-F exact-HEAD qualification: PASS` Git note.
-**P9-G implementation/qualification is active but not yet released:** the
-bounded local closure candidate was first committed at `43be8dd`, then
-amended as `4564d39` and `a952602`; it adds identity-fenced all-voter
-safe compaction, joint-consensus tombstone safety and retained-history
-Rebootstrap V2. Two pre-commit workspaces passed 730/730; `4564d39` exact
-HEAD failed P5 10/12. `a952602` exact HEAD first passed 730/730 but its
-second workspace failed P5 10/12. Independent diagnostics identified an
-unsafe former leader's rebootstrap veto killing a recoverable partition
-actor; the new uncommitted candidate keeps it non-serving for genuine P3
-recovery and blocks stale Fetch/idempotent acknowledgements. Targeted
-RF3/RF4 recovery testing has passed, but complete exact-clean-HEAD
-repeatability and the P9-G PASS Git note are still missing.
-Historical failed runs are retained in `docs/P9_G_WORK_IN_PROGRESS.md`;
-`docs/P9_G_CLOSURE_REPORT.md` records the candidate and limitations.
-P9-H/I and P10-P12 remain disabled until their predecessor gates pass.
+| Area | Current reality | Next milestone |
+| --- | --- | --- |
+| **P9 · Retention / rebootstrap** | Segmented V2 history and compaction machinery exist; **P9-G remains unqualified** | Exact-HEAD coordinated tombstone-safety/rebootstrap qualification, then P9-H/I cleaner stress and closure |
+| **P10 · Work queues** | Not implemented; reserved designs and protocol surface are not an active queue service | Durable delivery leases, retries, poison-message handling, visibility timeout, and dead-letter queues |
+| **P11 · Security and operations** | Local loopback demo, read-only Control Center, real monitoring MVP; **no broker/client auth or TLS** | Identity and authorization, secured transport, operational controls, alerting, rolling upgrades and full observability qualification |
+| **P12 · Release qualification** | Deterministic models, selected process-kill/recovery tests, and bounded local benchmarks | Extended chaos and network-fault campaigns, disk/power-loss testing, compatibility/endurance runs and publicly source-pinned performance validation |
 
-## Master project explanation and interview preparation
+Other deliberate limits: no cross-partition total order or transactions; no exactly-once guarantee for arbitrary external side effects; no hosted multi-region or WAN deployment; no measured production SLO; local prototype endpoints must **never** be exposed to untrusted networks.
 
-The [AstraLog Master Engineering & Interview Guide](docs/ASTRALOG_MASTER_GUIDE.md) explains the architecture in layman and technical terms, annotates every tracked file and directory, traces failure invariants, records benchmark limits and includes 60 adversarial interview questions with defensible answers. The guide is an educational companion, not production qualification.
+## Documentation and license
 
-## Canonical documents
+- [**Full architecture and interview guide**](docs/ASTRALOG_MASTER_GUIDE.md) — explanations, deep code walks, trade-offs, failure scenarios, and interview questions.
+- [**Current implementation / qualification state**](docs/CURRENT_STATE.md) — granular progress and open gates.
+- [**Runnable interview benchmark guide**](docs/INTERVIEW_READY.md) — methodology and raw-result provenance.
+- [**Control Center setup**](docs/CONTROL_CENTER.md) and [**Grafana/Prometheus setup**](docs/MONITORING_MVP.md).
+- [**Correctness invariants**](docs/INVARIANTS.md), [**system design decisions**](docs/DECISIONS.md), [**phase plan**](docs/PHASE_PLAN.md), and [**security disclosure**](SECURITY.md).
 
-1. [AstraLog Project Bible](docs/ASTRALOG_BIBLE.md)
-2. [Phase Plan & Exit Gates](docs/PHASE_PLAN.md)
-3. [Correctness Invariants](docs/INVARIANTS.md)
-4. [Research & Design References](docs/RESEARCH_REFERENCES.md)
-5. [Architecture Decision Log](docs/DECISIONS.md)
-6. [Feature-to-Phase Matrix](docs/FEATURE_MATRIX.md)
-7. [P0 Closure Report](docs/P0_CLOSURE_REPORT.md)
-8. [P1 Execution Checklist](docs/P1_CHECKLIST.md)
-9. [P1 Closure Report](docs/P1_CLOSURE_REPORT.md)
-10. [Wire Protocol V1](docs/PROTOCOL_V1.md)
-11. [P2 Execution Checklist](docs/P2_CHECKLIST.md)
-12. [P2 Closure Report](docs/P2_CLOSURE_REPORT.md)
-13. [Raft Core Contract V1](docs/RAFT_V1.md)
-14. [P3 Execution Checklist](docs/P3_CHECKLIST.md)
-15. [P3 Foundation Qualification](docs/P3_FOUNDATION_REPORT.md)
-16. [P3 Pre-Vote Qualification](docs/P3_PREVOTE_REPORT.md)
-17. [P3 RequestVote Qualification](docs/P3_REQUESTVOTE_REPORT.md)
-18. [P3 Leader Initialization Qualification](docs/P3_LEADER_INIT_REPORT.md)
-19. [P3 AppendEntries Heartbeat/Prefix Qualification](docs/P3_APPEND_HEARTBEAT_REPORT.md)
-20. [P3 Closure Report](docs/P3_CLOSURE_REPORT.md)
-21. [P4 Replicated Partition Contract V1](docs/P4_REPLICATION_V1.md)
-22. [P4 Execution Checklist](docs/P4_CHECKLIST.md)
-23. [P4 Closure Report](docs/P4_CLOSURE_REPORT.md)
-24. [P5 Controller and Placement Contract V1](docs/P5_CONTROLLER_V1.md)
-25. [P5 Execution Checklist](docs/P5_CHECKLIST.md)
-26. [P5-A Contract Freeze Report](docs/P5_CONTRACT_FREEZE_REPORT.md)
-27. [P5-B State Machine Qualification](docs/P5_STATE_MACHINE_REPORT.md)
-28. [P5-C Persistence Qualification](docs/P5_PERSISTENCE_REPORT.md)
-29. [P5-D Controller Runtime Qualification](docs/P5_RUNTIME_REPORT.md)
-30. [P5-E Controller Bootstrap Qualification](docs/P5_BOOTSTRAP_REPORT.md)
-31. [P5-F Broker Membership Qualification](docs/P5_MEMBERSHIP_REPORT.md)
-32. [P5-G Heartbeat / Failure Detector Qualification](docs/P5_HEARTBEAT_REPORT.md)
-33. [P5-H Topic Metadata / Placement Qualification](docs/P5_PLACEMENT_REPORT.md)
-34. [P5-I Metadata Epochs / Deltas + Broker Cache Qualification](docs/P5_METADATA_REPORT.md)
-35. [P5-J Dynamic P4 Integration Qualification](docs/P5_DYNAMIC_INTEGRATION_REPORT.md)
-36. [P5-K/L Replica Movement Qualification](docs/P5_MOVEMENT_REPORT.md)
-37. [P5-N Active Cluster Feature Level Qualification](docs/P5_FEATURE_LEVEL_REPORT.md)
-38. [P5-O Producer-ID Allocator Qualification](docs/P5_PRODUCER_ID_REPORT.md)
-39. [Post-P5-O Raft / Movement Boundary Repair](docs/P5_BOUNDARY_REPAIR_REPORT.md)
-40. [P5-M Leadership Hook Qualification](docs/P5_LEADERSHIP_REPORT.md)
-41. [P5-P Failure Qualification](docs/P5_FAILURE_REPORT.md)
-42. [P5 Closure Report](docs/P5_CLOSURE_REPORT.md)
-43. [P6 Consumer Groups / Offsets Contract V1](docs/P6_GROUPS_V1.md)
-44. [P6 Execution Checklist](docs/P6_CHECKLIST.md)
-45. [P6-A Contract Freeze Report](docs/P6_CONTRACT_FREEZE_REPORT.md)
-46. [P6-B Types / Codecs / Golden Bytes Qualification](docs/P6_CODECS_REPORT.md)
-47. [P6-C Internal Topics / Coordinator Routing Qualification](docs/P6_ROUTING_REPORT.md)
-48. [P6-D Pure Durable Group State Machine Qualification](docs/P6_STATE_MACHINE_REPORT.md)
-49. [P6-E Deterministic Uniform-Sticky Assignor Qualification](docs/P6_ASSIGNOR_REPORT.md)
-50. [P6-F Cooperative Revocation / Activation Qualification](docs/P6_COOPERATIVE_REPORT.md)
-51. [P6-G Heartbeats / Session Timeout / Static Membership Qualification](docs/P6_SESSION_REPORT.md)
-52. [P6-H Replicated Group Coordinator / Recovery Qualification](docs/P6_COORDINATOR_REPORT.md)
-53. [P6-I Durable Offsets / Fencing Qualification](docs/P6_OFFSETS_REPORT.md)
-54. [P6-J Broker / Client Integration Qualification](docs/P6_INTEGRATION_REPORT.md)
-55. [P6-K Failure / Churn / Model Qualification](docs/P6_FAILURE_CHURN_REPORT.md)
-56. [P6 Closure Report](docs/P6_CLOSURE_REPORT.md)
-57. [P7 Idempotent Producer Contract V1](docs/P7_PRODUCER_V1.md)
-58. [P7 Execution Checklist](docs/P7_CHECKLIST.md)
-59. [P7-A Contract Freeze Report](docs/P7_CONTRACT_FREEZE_REPORT.md)
-60. [ADR-017 Producer Epoch Authority](docs/ADR_017_PRODUCER_EPOCH_AUTHORITY.md)
-61. [P7-B Types / Codecs / Golden Bytes Qualification](docs/P7_CODECS_REPORT.md)
-62. [P7-C Controller Producer-Session Authority / V2 Persistence Qualification](docs/P7_CONTROLLER_REPORT.md)
-63. [P7-D Pure Partition Producer State Machine Qualification](docs/P7_STATE_MACHINE_REPORT.md)
-64. [P7-E Storage V1 Producer Metadata / ApplicationCommand V2 Qualification](docs/P7_STORAGE_REPORT.md)
-65. [P7-F Runtime Admission / Pending Duplicate Suppression Qualification](docs/P7_RUNTIME_REPORT.md)
-66. [P7-G Producer Snapshot / Crash Recovery Qualification](docs/P7_SNAPSHOT_REPORT.md)
-67. [P7-H Broker / Client Integration Qualification](docs/P7_INTEGRATION_REPORT.md)
-68. [P7-I Lost-Response / Fencing / Real RF3 Failover Qualification](docs/P7_FAILOVER_REPORT.md)
-69. [P7-J Deterministic Models / Resource Bounds / Scheduling Stress Qualification](docs/P7_MODEL_STRESS_REPORT.md)
-70. [P7-J Current-Term Leader Readiness Boundary Repair](docs/P7_J_BOUNDARY_REPAIR_REPORT.md)
-71. [P7 Closure Report](docs/P7_CLOSURE_REPORT.md)
-72. [P8 Batching / Compression / Flow Control / Performance Contract V1](docs/P8_PERFORMANCE_V1.md)
-73. [P8 Execution Checklist](docs/P8_CHECKLIST.md)
-74. [P8-A Contract Freeze Report](docs/P8_CONTRACT_FREEZE_REPORT.md)
-75. [P8-B Controller Topic-Performance Metadata Qualification](docs/P8_CONTROLLER_METADATA_REPORT.md)
-76. [P8-C Storage V1 Compression and Recovery Qualification](docs/P8_STORAGE_COMPRESSION_REPORT.md)
-77. [P8-D Client Per-Partition Accumulator and Batching Qualification](docs/P8_CLIENT_BATCHING_REPORT.md)
-78. [P8-E Persistence Group-Commit Architecture Blocker](docs/P8_E_ARCHITECTURE_BLOCKER.md)
-79. [Accepted P8-E Persistence Frontier ADR](docs/ADR_P8_E_PERSISTENCE_FRONTIER.md)
-80. [Persistence Frontier V2](docs/PERSISTENCE_FRONTIER_V2.md)
-81. [P8-E Persistence Frontier Architecture Re-Freeze](docs/P8_E_REFREEZE_REPORT.md)
-82. [P8-E Persistence Group Commit Qualification](docs/P8_PERSISTENCE_GROUP_COMMIT_REPORT.md)
-83. [P8-F Replication Pipelining and Fetch Tuning Qualification](docs/P8_REPLICATION_FETCH_REPORT.md)
-84. [P8-G Bounded Backpressure, Watermarks and Quotas Qualification](docs/P8_BACKPRESSURE_QUOTA_REPORT.md)
-85. [P8-H Benchmark Harness and Deterministic Baseline Tooling Qualification](docs/P8_BENCHMARK_HARNESS_REPORT.md)
-86. [P8 Engineering Baseline — Generated Report](docs/baselines/P8_ENGINEERING_BASELINE.md)
-87. [P8 Closure Report](docs/P8_CLOSURE_REPORT.md)
-88. [P9 Retention and Log Compaction Contract V1](docs/P9_RETENTION_COMPACTION_V1.md)
-89. [Retained-History Storage Format V2](docs/FORMAT_V2.md)
-90. [P9 Execution Checklist](docs/P9_CHECKLIST.md)
-91. [ADR-019 — Sparse Retained-History Storage V2](docs/ADR_019_P9_SPARSE_RETAINED_HISTORY.md)
-92. [P9-A Contract / Storage V2 Architecture Freeze Report](docs/P9_CONTRACT_FREEZE_REPORT.md)
-93. [P9-B Controller Retention Metadata and Public Codec Qualification](docs/P9_CONTROLLER_RETENTION_METADATA_REPORT.md)
-94. [P9-C Storage V2 and Manifest Inventory Qualification](docs/P9_STORAGE_V2_MANIFEST_REPORT.md)
-95. [P9-D Replicated Log Start and Delete Retention Qualification](docs/P9_LOG_START_DELETE_RETENTION_REPORT.md)
-96. [P9-E Copy-on-Write Keyed Compaction Qualification](docs/P9_KEYED_COMPACTION_REPORT.md)
-97. [P9-F Producer Checkpoint and Compaction-Safe P7 Recovery Qualification](docs/P9_PRODUCER_CHECKPOINT_REPORT.md)
+Licensed under [Apache License 2.0](LICENSE).
 
-## One-sentence architecture
-
-AstraLog uses a **small Raft controller quorum for authoritative cluster metadata** and a **Raft group per data partition for ordered, replicated event storage**, with clients routing directly to partition leaders after bootstrapping from any broker.
-
-## Non-negotiable honesty rule
-
-Benchmark numbers in the README are never hand-written aspirations. They must
-be generated from benchmark tooling and include hardware/software/configuration
-metadata. Archived measurements from the previous private lineage are labeled
-historical; **new publicly reproducible claims require an exact reachable,
-tagged source commit** and fresh raw results from that commit.
+**AstraLog is an engineering exploration of how durable distributed logs work, why failures are ambiguous, and how to test the safety boundaries without claiming they are already production-qualified.**
