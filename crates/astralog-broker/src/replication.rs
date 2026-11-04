@@ -14,7 +14,8 @@ use astralog_controller::{
 use astralog_groups::is_reserved_internal_topic_name;
 use astralog_protocol::{PublicError, UNKNOWN_BROKER_ID, UNKNOWN_EPOCH, api::validate_topic_name};
 use astralog_raft::{
-    ConfigurationChange, NodeId, ProposalId, Role, StableConfiguration, TimingConfig,
+    ConfigurationChange, EffectiveConfiguration, NodeId, ProposalId, Role, StableConfiguration,
+    TimingConfig,
 };
 use astralog_replication::{
     AckRequirement, CleanProgressReport, CleanProgressTracker, CommandLimits,
@@ -3178,11 +3179,16 @@ fn flush_outbound(
 ) -> Result<Option<bool>> {
     let outbound = replica.drain_outbound().collect::<Vec<_>>();
     if outbound.is_empty() {
-        return Ok(None);
+        // Do not retain a stale transport backpressure observation forever.
+        // The underlying Raft outbox has just been drained, and all pending
+        // proposal and transport queues retain their independent hard bounds.
+        return Ok(Some(false));
     }
-    let mut congested = false;
+    let mut congested_voters = BTreeSet::new();
+    let effective = replica.membership_observation().effective_configuration;
     for message in outbound {
-        let target_broker = node_to_broker(message.target)?;
+        let target_node = message.target;
+        let target_broker = node_to_broker(target_node)?;
         let result = if let astralog_raft::RaftMessage::InstallSnapshotRequest(request) =
             &message.message
         {
@@ -3268,12 +3274,81 @@ fn flush_outbound(
         match result {
             Ok(()) => {}
             Err(astralog_replication::ReplicationError::Busy(_)) => {
-                congested = true;
+                if effective.contains_voter(target_node) {
+                    congested_voters.insert(target_node);
+                }
             }
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(Some(congested))
+    // A missing peer's bounded outbound queue must not veto the *surviving*
+    // RF3 quorum. Conversely, if transport backpressure affects enough voters
+    // to lose either stable or joint-config quorum, reject new producer work.
+    // This is admission only: Raft itself still decides commit and never
+    // acknowledges an insufficient quorum, and pending memory remains bounded.
+    Ok(Some(transport_voter_quorum_congested(
+        &effective,
+        &congested_voters,
+    )))
+}
+
+fn transport_voter_quorum_congested(
+    effective: &EffectiveConfiguration,
+    congested_voters: &BTreeSet<NodeId>,
+) -> bool {
+    let admitted = effective
+        .voters()
+        .difference(congested_voters)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    !effective.has_voter_quorum(&admitted)
+}
+
+#[cfg(test)]
+mod transport_quorum_admission_tests {
+    use super::*;
+    use astralog_raft::JointConfiguration;
+
+    #[test]
+    fn single_unavailable_rf3_voter_or_learner_cannot_block_quorum_writes() {
+        let voter = |id| broker_to_node(id).unwrap();
+        let stable = EffectiveConfiguration::Stable(
+            StableConfiguration::new([voter(1), voter(2), voter(3)], [voter(4)]).unwrap(),
+        );
+        assert!(!transport_voter_quorum_congested(&stable, &BTreeSet::new()));
+        assert!(!transport_voter_quorum_congested(
+            &stable,
+            &BTreeSet::from([voter(1)])
+        ));
+        assert!(!transport_voter_quorum_congested(
+            &stable,
+            &BTreeSet::from([voter(4)])
+        ));
+        assert!(transport_voter_quorum_congested(
+            &stable,
+            &BTreeSet::from([voter(1), voter(2)]),
+        ));
+    }
+
+    #[test]
+    fn joint_configuration_requires_both_old_and_new_quorums() {
+        let voter = |id| broker_to_node(id).unwrap();
+        let old = StableConfiguration::new([voter(1), voter(2), voter(3)], []).unwrap();
+        let new = StableConfiguration::new([voter(2), voter(3), voter(4)], []).unwrap();
+        let joint = EffectiveConfiguration::Joint(JointConfiguration::new(old, new).unwrap());
+        assert!(!transport_voter_quorum_congested(
+            &joint,
+            &BTreeSet::from([voter(1)])
+        ));
+        assert!(transport_voter_quorum_congested(
+            &joint,
+            &BTreeSet::from([voter(2), voter(3)]),
+        ));
+        assert!(transport_voter_quorum_congested(
+            &joint,
+            &BTreeSet::from([voter(1), voter(2)]),
+        ));
+    }
 }
 
 fn partition_status(replica: &ReplicatedPartition) -> PartitionStatus {
