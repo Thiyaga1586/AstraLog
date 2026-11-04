@@ -1175,13 +1175,13 @@ async fn p7_rf3_leader_death_before_request_reaches_persistence_retries_sequence
         .unwrap();
     let outcome = match first_outcome {
         Ok(outcome) => outcome,
-        Err(ClientError::Timeout) => {
-            // Automatic Produce retry is intentionally bounded. Under a full
-            // serialized workspace run the successor election/current-term
-            // barrier can outlive that retry budget. Retry exhaustion must
-            // retain the exact unresolved producer range, so explicit retry
-            // can refresh routing and continue without allocating a new
-            // sequence or creating a second logical batch.
+        Err(ClientError::Timeout | ClientError::ConnectionClosed | ClientError::Io(_)) => {
+            // The killed leader may close or reset its TCP connection instead
+            // of exhausting the bounded automatic retry budget as a timeout.
+            // All three outcomes are ambiguous, not terminal for an idempotent
+            // request: the client must retain the exact unresolved sequence.
+            // An explicit retry after successor election must commit it once,
+            // without allocating a new sequence or duplicating the batch.
             let (successor_id, successor_epoch) = harness
                 .wait_partition_leader_excluding(Some(leader_id))
                 .await;

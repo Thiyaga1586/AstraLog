@@ -1,6 +1,14 @@
 # AstraLog: runnable SDE interview demo
 
-**Snapshot:** 2026-11-03 · **benchmark source:** `d7e32d3` · **scope:** portfolio demonstration, **not** a production release.
+**Snapshot:** 2026-11-03 · **historical private-lineage benchmark source:** `d7e32d3` (not reachable in the sanitized public repository) · **scope:** portfolio demonstration, **not** a production release.
+
+**Provenance warning:** The included historical CSV, logs and summary record
+measurements from the original private development lineage. This sanitized
+repository contains the benchmark implementation, but its historical source
+commits (including `d7e32d3` and `563ede6`) are absent. These archived results
+are **not verified as reproducible at the current public commit**; rerun a
+release benchmark on a reachable, tagged public commit for new performance
+claims. The recorded hardware and benchmark configuration remain below.
 
 ## What is actually running
 
@@ -39,7 +47,7 @@ PowerShell, from the project root; Rust 1.98.1 is pinned by
 `--offline`.
 
 ```powershell
-cd D:\Workspace\AstraLog
+# Run from the root directory of your AstraLog checkout.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interview-demo.ps1
 ```
 

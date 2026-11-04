@@ -104,9 +104,17 @@ The project is intentionally built to expose the hard systems problems rather th
 The checked-in [interview demo and benchmark guide](docs/INTERVIEW_READY.md)
 starts real RF1 and RF3 brokers on local TCP, creates topics, produces data,
 fetches committed records, and reports measured throughput and p50/p95/p99
-latency. A committed release benchmark source (`d7e32d3`) completed
+latency. A historical private-lineage release benchmark source (`d7e32d3`) completed
 **12 workload measurements with zero producer errors**; three focused
 restart/failover/deduplication checks also passed.
+
+**Public-history provenance:** This repository uses a sanitized, shortened
+history. Older commit identifiers cited in this README and in qualification
+reports, including `d7e32d3`, belong to the earlier private development
+lineage and are **not reachable in this repository**. The checked-in benchmark
+CSVs and logs are historical evidence, not an exact-commit reproduction on the
+sanitized public history. Rerun the release benchmark from a reachable, tagged
+commit before presenting new results as publicly reproducible at that commit.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interview-demo.ps1
@@ -139,12 +147,11 @@ Windows clean-restart tests do not prove sudden
 power-loss durability. P9-G retained-history V2 exact-HEAD qualification
 remains separate from the interview milestone.
 
-**Before creating a new public GitHub repository:** Remove private paths from
-the *published history*, not just the latest files. After finalizing a clean
-local commit, `scripts/prepare-public-snapshot.ps1` can generate a snapshot
-without any old Git history. Inspect it before initializing a new repository.
-The old benchmark commit SHA will not exist in that new history; run fresh
-release benchmarks from the new public commit for publicly verifiable numbers.
+**For any further public-history export:** Remove private paths from the
+*published history*, not just the latest files. The
+`scripts/prepare-public-snapshot.ps1` helper can generate a snapshot without
+old Git history. Inspect the export and rerun release benchmarks on its own
+reachable commit before claiming publicly verifiable performance figures.
 
 ## Current status
 
@@ -590,4 +597,8 @@ AstraLog uses a **small Raft controller quorum for authoritative cluster metadat
 
 ## Non-negotiable honesty rule
 
-Benchmark numbers in the README are never hand-written aspirations. They must be generated from committed benchmark tooling, include hardware/software/configuration metadata, and be reproducible from a tagged commit.
+Benchmark numbers in the README are never hand-written aspirations. They must
+be generated from benchmark tooling and include hardware/software/configuration
+metadata. Archived measurements from the previous private lineage are labeled
+historical; **new publicly reproducible claims require an exact reachable,
+tagged source commit** and fresh raw results from that commit.
