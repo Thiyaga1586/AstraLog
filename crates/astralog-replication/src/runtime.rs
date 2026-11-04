@@ -544,15 +544,29 @@ impl ReplicatedPartition {
         // previous snapshot was already persisted. Raft correctly rejects a
         // duplicate RequestSnapshot(index), but retention needs an idempotent
         // no-op when that exact boundary is already covered by durable state.
-        if committed <= self.core.snapshot().last_included_index {
+        let snapshot_floor = self.core.snapshot().last_included_index;
+        if snapshot_floor != self.persistence.snapshot().last_included_index {
+            return Err(ReplicationError::Invalid(
+                "P9 Raft snapshot floor differs from persisted snapshot floor",
+            ));
+        }
+        if committed < snapshot_floor {
+            return Err(ReplicationError::Invalid(
+                "P9 durable commit is behind persisted snapshot floor",
+            ));
+        }
+        if committed == snapshot_floor {
             return Ok(committed);
+        }
+        if committed > self.core.volatile_state().commit_index {
+            return Err(ReplicationError::Invalid(
+                "P9 durable commit exceeds Raft volatile commit",
+            ));
         }
         // The durable commit index can briefly lead state-machine application.
         // Never request a snapshot of an unapplied prefix or silently treat
         // that prefix as cleaned. Let the bounded maintenance caller retry.
-        if committed > self.core.volatile_state().last_applied
-            || committed > self.core.volatile_state().commit_index
-        {
+        if committed > self.core.volatile_state().last_applied {
             return Err(ReplicationError::Busy(
                 "P9 snapshot commit is not yet applied",
             ));
